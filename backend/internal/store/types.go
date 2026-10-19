@@ -448,12 +448,12 @@ var retiredBuiltinModels = map[string]struct{}{
 // also where the operator's own enable/disable choices and usage counters live
 // and must not be replaced.
 //
-// Retirement is deliberately narrower than the merge. An entry is dropped only
-// when it is built-in, retired, and has never served a request: a never-used
-// entry holds nothing the operator put there, while one with counters is also a
-// row of history — deleting it would silently rewrite past usage. Those are left
-// enabled and visible so the operator can decide; the alternative, disabling
-// them on every boot, would keep overriding a choice that is theirs to make.
+// Retirement is unconditional. A built-in whose upstream id is gone cannot
+// serve anything, and a catalogue entry is exactly what every client puts in
+// its picker — keeping one "for the history" advertises a model that no longer
+// exists. The history is not lost with it: the audit log records the model id
+// and the token counts of every call, so dropping the entry removes a label,
+// not a record.
 //
 // Entries already present are left exactly as stored. Only the *existence* of a
 // built-in is enforced, never its state — with one deliberate exception: fields
@@ -470,7 +470,7 @@ func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
 	changed := false
 	kept := models[:0]
 	for _, model := range models {
-		if model != nil && model.Builtin && model.Requests == 0 && model.Tokens == 0 {
+		if model != nil && model.Builtin {
 			if _, retired := retiredBuiltinModels[model.ID]; retired {
 				changed = true
 				continue

@@ -664,33 +664,30 @@ func TestBuiltinModelsCoverTheUpstreamSelector(t *testing.T) {
 	}
 }
 
-// A retired built-in leaves an install that never used it, and stays where it
-// carries history.
+// A retired built-in leaves the catalogue, counters or not.
 //
-// Deleting it outright would rewrite past usage; disabling it on every boot
-// would keep overriding the operator's own choice. Both are worse than the one
-// rule here: no counters, no attachment, no removal.
-func TestMergeBuiltinModelsRetiresUnusedEntriesOnly(t *testing.T) {
+// The entry is what every client shows in its picker, and the model behind it
+// no longer exists upstream. Usage history survives in the audit log, which
+// records the model id and token counts per call, so dropping the label is not
+// the same as dropping the record.
+func TestMergeBuiltinModelsRetiresEntriesWithUsageToo(t *testing.T) {
 	stored := []*ModelConfig{
 		{ID: "minimax-m2.7", Name: "MiniMax M2.7", Builtin: true, Enabled: true},
-		{ID: "minimax-m2.7-highspeed", Name: "MiniMax M2.7 HighSpeed", Builtin: true, Enabled: true, Requests: 3},
+		{ID: "minimax-m2.7-highspeed", Name: "MiniMax M2.7 HighSpeed", Builtin: true, Enabled: true, Requests: 3, Tokens: 1200},
 		{ID: "minimax-m3.1-flash-preview", Name: "MiniMax M3.1 Flash Preview", Builtin: true, Enabled: true},
 	}
 	merged, changed := MergeBuiltinModels(stored)
 	if !changed {
-		t.Fatal("retiring unused entries and adding the released model must report a change")
+		t.Fatal("retiring entries and adding the released model must report a change")
 	}
 	byID := make(map[string]*ModelConfig, len(merged))
 	for _, model := range merged {
 		byID[model.ID] = model
 	}
-	for _, id := range []string{"minimax-m2.7", "minimax-m3.1-flash-preview"} {
+	for _, id := range []string{"minimax-m2.7", "minimax-m2.7-highspeed", "minimax-m3.1-flash-preview"} {
 		if _, ok := byID[id]; ok {
-			t.Errorf("%s has no usage and is retired; it must not survive the merge", id)
+			t.Errorf("%s is retired upstream; it must not stay in the catalogue", id)
 		}
-	}
-	if _, ok := byID["minimax-m2.7-highspeed"]; !ok {
-		t.Error("a retired entry with usage counters is also a row of history and must be kept")
 	}
 	if _, ok := byID["minimax-m3.1-flash"]; !ok {
 		t.Error("the released model must be added")
