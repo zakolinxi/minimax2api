@@ -640,16 +640,14 @@ func TestBuiltinVideoRangesDifferByResolutionOnly(t *testing.T) {
 	}
 }
 
-// The catalogue must name every model the desktop client offers, so a client
-// filling its picker from /v1/models can select each of them.
+// The catalogue must name every model the upstream's config endpoint lists, so
+// a client filling its picker from /v1/models can select each of them.
 func TestBuiltinModelsCoverTheUpstreamSelector(t *testing.T) {
 	want := map[string]string{
-		"minimax-agent":              "",
-		"minimax-m3.1-flash-preview": "MiniMax-M3.1-Flash-Preview",
-		"minimax-m3":                 "MiniMax-M3",
-		"minimax-m3-thinking":        "",
-		"minimax-m2.7":               "MiniMax-M2.7",
-		"minimax-m2.7-highspeed":     "MiniMax-M2.7-highspeed",
+		"minimax-agent":       "",
+		"minimax-m3.1-flash":  "MiniMax-M3.1-Flash",
+		"minimax-m3":          "MiniMax-M3",
+		"minimax-m3-thinking": "",
 	}
 	for _, model := range BuiltinModels() {
 		expected, ok := want[model.ID]
@@ -663,6 +661,42 @@ func TestBuiltinModelsCoverTheUpstreamSelector(t *testing.T) {
 	}
 	for id := range want {
 		t.Errorf("the catalogue has no entry for %q", id)
+	}
+}
+
+// A retired built-in leaves an install that never used it, and stays where it
+// carries history.
+//
+// Deleting it outright would rewrite past usage; disabling it on every boot
+// would keep overriding the operator's own choice. Both are worse than the one
+// rule here: no counters, no attachment, no removal.
+func TestMergeBuiltinModelsRetiresUnusedEntriesOnly(t *testing.T) {
+	stored := []*ModelConfig{
+		{ID: "minimax-m2.7", Name: "MiniMax M2.7", Builtin: true, Enabled: true},
+		{ID: "minimax-m2.7-highspeed", Name: "MiniMax M2.7 HighSpeed", Builtin: true, Enabled: true, Requests: 3},
+		{ID: "minimax-m3.1-flash-preview", Name: "MiniMax M3.1 Flash Preview", Builtin: true, Enabled: true},
+	}
+	merged, changed := MergeBuiltinModels(stored)
+	if !changed {
+		t.Fatal("retiring unused entries and adding the released model must report a change")
+	}
+	byID := make(map[string]*ModelConfig, len(merged))
+	for _, model := range merged {
+		byID[model.ID] = model
+	}
+	for _, id := range []string{"minimax-m2.7", "minimax-m3.1-flash-preview"} {
+		if _, ok := byID[id]; ok {
+			t.Errorf("%s has no usage and is retired; it must not survive the merge", id)
+		}
+	}
+	if _, ok := byID["minimax-m2.7-highspeed"]; !ok {
+		t.Error("a retired entry with usage counters is also a row of history and must be kept")
+	}
+	if _, ok := byID["minimax-m3.1-flash"]; !ok {
+		t.Error("the released model must be added")
+	}
+	if _, again := MergeBuiltinModels(merged); again {
+		t.Error("the retirement must be idempotent")
 	}
 }
 

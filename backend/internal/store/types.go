@@ -327,16 +327,22 @@ type State struct {
 //
 // The chat entries all reach the same upstream agent; a conversation cannot be
 // routed to a different service by naming a different model. What an entry can
-// do since the upstream grew a model selector (the desktop client picks between
-// M3.1-Flash-Preview, M3, M2.7 and M2.7 HighSpeed) is *name* the model, and
-// that is what UpstreamModel carries: the id placed into the request's `model`
-// object. An entry without one — `minimax-agent`, `minimax-m3-thinking` — sends
-// no model field at all, exactly as every build before the selector did.
+// do since the upstream grew a model selector is *name* the model, and that is
+// what UpstreamModel carries: the id the upstream's own config endpoint lists
+// for it. Whether that id is actually transmitted depends on the entry's kind —
+// a video entry writes it into the generation-options block, while the chat
+// body's `model` object is filled from the console's template, because the
+// selector's own serialisation has never been captured; see buildMessageBody.
+// An entry without an id — `minimax-agent`, `minimax-m3-thinking` — sends no
+// model field at all, exactly as every build before the selector did.
 //
-// The ids below are the ones the upstream's own config endpoint lists
-// (`MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`); M3.1 follows the
-// same pattern from its desktop label. The global model-field template can
-// still override or extend any of this; see buildMessageBody.
+// The ids below are the ones that endpoint currently lists
+// (`MiniMax-M3.1-Flash`, `MiniMax-M3`). It is authoritative in both directions:
+// when M3.1-Flash went from preview to general availability in October 2026,
+// M2.7 and M2.7-highspeed disappeared from it, and the catalogue follows rather
+// than keeping dead labels. Installs that froze the old list are handled by
+// retiredBuiltinModels. The global model-field template can still override or
+// extend any of this; see buildMessageBody.
 //
 // The video entries are different in kind. MiniMax-H3 is not reachable as a
 // chat model at all — it is a plugin the agent calls server-side, selected by
@@ -350,27 +356,18 @@ func BuiltinModels() []*ModelConfig {
 			Enabled: true, Builtin: true, Description: "通用 Agent，自动规划并调用工具",
 		},
 		{
-			ID: "minimax-m3.1-flash-preview", Name: "MiniMax M3.1 Flash Preview", Upstream: "chat",
-			UpstreamModel: "MiniMax-M3.1-Flash-Preview", Type: ModelTypeChat,
+			ID: "minimax-m3.1-flash", Name: "MiniMax M3.1 Flash", Upstream: "chat",
+			UpstreamModel: "MiniMax-M3.1-Flash", Type: ModelTypeChat,
 			Enabled: true, Builtin: true,
-			Description: "桌面端新增的预览版；上游按账号默认模型回答",
+			Description: "最新旗舰 Flash，强制思考；支持 reasoning_effort 档位",
 		},
 		{
 			ID: "minimax-m3", Name: "MiniMax M3", Upstream: "chat", UpstreamModel: "MiniMax-M3", Type: ModelTypeChat,
-			Enabled: true, Builtin: true, Description: "对话模式，响应更快",
+			Enabled: true, Builtin: true, Description: "上一代旗舰，思考可开关",
 		},
 		{
 			ID: "minimax-m3-thinking", Name: "MiniMax M3 Thinking", Upstream: "think", Type: ModelTypeChat,
 			Enabled: true, Builtin: true, Description: "深度思考模式，附带推理内容",
-		},
-		{
-			ID: "minimax-m2.7", Name: "MiniMax M2.7", Upstream: "chat", UpstreamModel: "MiniMax-M2.7", Type: ModelTypeChat,
-			Enabled: true, Builtin: true, Description: "上一代对话模型",
-		},
-		{
-			ID: "minimax-m2.7-highspeed", Name: "MiniMax M2.7 HighSpeed", Upstream: "chat",
-			UpstreamModel: "MiniMax-M2.7-highspeed", Type: ModelTypeChat,
-			Enabled: true, Builtin: true, Description: "上一代对话模型的高速版",
 		},
 		{
 			ID: "minimax-image", Name: "MiniMax Image", Upstream: "image", Type: ModelTypeImage,
@@ -425,16 +422,38 @@ func videoDurations() []int {
 	return []int{5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 }
 
-// MergeBuiltinModels adds any built-in entry the stored catalogue is missing.
+// retiredBuiltinModels are catalogue ids the upstream no longer offers.
 //
-// Without this a new built-in never reaches an existing install. `Open` only
-// seeds the catalogue when it is *empty*, so on every install that already has
-// models the list is whatever that install first froze — and a release that adds
-// a model would ship it to new users only, with no symptom on anyone else's
-// machine. That is the same trap the settings defaults fall into; the difference
-// is that here the fix has to be a merge, because the stored list is also where
-// the operator's own enable/disable choices and usage counters live and must not
-// be replaced.
+// M2.7 and its highspeed sibling were dropped when M3.1-Flash went from preview
+// to general availability (October 2026), and the preview id was renamed to the
+// released one. They are listed here rather than simply deleted from
+// BuiltinModels because deletion alone does nothing to an existing install: the
+// stored list is never pruned, so the dead entries would stay on screen forever
+// while new installs never see them.
+var retiredBuiltinModels = map[string]struct{}{
+	"minimax-m2.7":               {},
+	"minimax-m2.7-highspeed":     {},
+	"minimax-m3.1-flash-preview": {},
+}
+
+// MergeBuiltinModels adds any built-in entry the stored catalogue is missing,
+// and retires entries the upstream has dropped.
+//
+// Without the merge a new built-in never reaches an existing install. `Open`
+// only seeds the catalogue when it is *empty*, so on every install that already
+// has models the list is whatever that install first froze — and a release that
+// adds a model would ship it to new users only, with no symptom on anyone
+// else's machine. That is the same trap the settings defaults fall into; the
+// difference is that here the fix has to be a merge, because the stored list is
+// also where the operator's own enable/disable choices and usage counters live
+// and must not be replaced.
+//
+// Retirement is deliberately narrower than the merge. An entry is dropped only
+// when it is built-in, retired, and has never served a request: a never-used
+// entry holds nothing the operator put there, while one with counters is also a
+// row of history — deleting it would silently rewrite past usage. Those are left
+// enabled and visible so the operator can decide; the alternative, disabling
+// them on every boot, would keep overriding a choice that is theirs to make.
 //
 // Entries already present are left exactly as stored. Only the *existence* of a
 // built-in is enforced, never its state — with one deliberate exception: fields
@@ -448,6 +467,19 @@ func videoDurations() []int {
 // Normalize, and it applies with more force here: these fields are not reachable
 // by any other route at all.
 func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
+	changed := false
+	kept := models[:0]
+	for _, model := range models {
+		if model != nil && model.Builtin && model.Requests == 0 && model.Tokens == 0 {
+			if _, retired := retiredBuiltinModels[model.ID]; retired {
+				changed = true
+				continue
+			}
+		}
+		kept = append(kept, model)
+	}
+	models = kept
+
 	builtinByID := make(map[string]*ModelConfig)
 	for _, builtin := range BuiltinModels() {
 		builtinByID[builtin.ID] = builtin
@@ -458,7 +490,6 @@ func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
 			known[model.ID] = struct{}{}
 		}
 	}
-	changed := false
 	for _, model := range models {
 		if model == nil || !model.Builtin {
 			continue
