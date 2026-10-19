@@ -32,7 +32,9 @@ const ENDPOINTS: EndpointDoc[] = [
   -H "Authorization: Bearer sk-mm-xxxx" \\
   -H "Content-Type: application/json" \\
   -d '{
-    "model": "minimax-m3-thinking",
+    "model": "minimax-m3.1-flash",
+    "thinking": true,
+    "context_window": 1000000,
     "stream": true,
     "messages": [
       { "role": "user", "content": "用一句话解释快速排序" }
@@ -46,6 +48,8 @@ data: [DONE]`,
     parameters: [
       { name: "model", type: "string", required: true, noteKey: "docs.noteModel" },
       { name: "messages", type: "array", required: true, noteKey: "docs.noteMessages" },
+      { name: "thinking", type: "boolean", noteKey: "docs.noteThinking" },
+      { name: "context_window", type: "number", noteKey: "docs.noteContextWindow" },
       { name: "stream", type: "boolean", noteKey: "docs.noteStream" },
       { name: "temperature", type: "number", noteKey: "docs.notePassthrough" },
       { name: "max_tokens", type: "number", noteKey: "docs.noteMaxTokens" },

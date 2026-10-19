@@ -139,19 +139,43 @@ func TestAnthropicMessagesResolvesAForeignModelName(t *testing.T) {
 }
 
 // A name that does match the catalogue is honoured, which is what lets someone
-// pin the thinking variant on purpose.
+// pin a model on purpose.
 func TestAnthropicMessagesHonoursAKnownModelName(t *testing.T) {
 	h := newHarness(t, acceptsEverything(upstreamText("ok")))
 	h.addAccount(t, "a", "token-a", 0)
 
 	rec := h.anthropic(t, map[string]any{
-		"model":    "minimax-m3-thinking",
+		"model":    "minimax-m3.1-flash",
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	}, h.key)
 
 	body := decodeJSON(t, rec)
-	if body["model"] != "minimax-m3-thinking" {
+	if body["model"] != "minimax-m3.1-flash" {
 		t.Fatalf("known model was not honoured: %v", body["model"])
+	}
+}
+
+// Anthropic's thinking block is the same knob as the OpenAI-side `thinking`
+// field, so it has to reach the upstream as the model object's variant.
+func TestAnthropicMessagesMapsThinkingOntoTheVariant(t *testing.T) {
+	var captured map[string]any
+	h := newHarness(t, captureUpstream(t, &captured))
+	h.addAccount(t, "a", "token-a", 0)
+
+	rec := h.anthropic(t, map[string]any{
+		"model":    "minimax-m3",
+		"thinking": map[string]any{"type": "enabled", "budget_tokens": 2048},
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, h.key)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	selection, _ := captured["model"].(map[string]any)
+	if selection["model_id"] != "MiniMax-M3" {
+		t.Fatalf("model object = %v", captured["model"])
+	}
+	if selection["variant"] != "thinking" {
+		t.Errorf("variant = %v, want thinking", selection["variant"])
 	}
 }
 

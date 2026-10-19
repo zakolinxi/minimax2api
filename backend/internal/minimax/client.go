@@ -198,6 +198,18 @@ type Options struct {
 	// not because it has been shown to unlock the video service. Do not read
 	// this field as the switch that turns generation on.
 	ClientIntent string
+	// Model is the upstream selector for this turn: the catalogue entry's
+	// UpstreamModel. Empty means the turn names no model, which is what the
+	// agent entry does.
+	Model string
+	// Variant is the model object's `variant`: "thinking" turns the reasoning
+	// variant on and "" turns it off. Nil omits the field entirely, which lets
+	// the upstream apply its own default — that is the difference a plain
+	// `thinking` boolean cannot express, and the reason this is a pointer.
+	Variant *string
+	// ContextLimit asks for a context window, in tokens. Zero omits the field
+	// and leaves the upstream default in place.
+	ContextLimit int
 	Images       []UploadedImage
 	// Files ride along as `meta`/`cloud` attachment envelopes after being
 	// pushed to the object store with the turn's own credential. See
@@ -789,6 +801,11 @@ func (c *Client) sendMessage(ctx context.Context, opts Options, sessionID string
 // request was a mistake worth remembering.
 const imageAttachmentKind = "image"
 
+// upstreamProviderID is the `provider_id` the config endpoint reports for every
+// model it lists. The model object is rejected without one, so it is sent
+// verbatim rather than guessed per model.
+const upstreamProviderID = "minimax"
+
 // buildMessageBody renders the request body for one turn.
 //
 // The agent expects the whole conversation in a single `content` string, which
@@ -853,18 +870,33 @@ func buildMessageBody(settings config.Settings, opts Options, turnID string) map
 		body["attachments"] = attachments
 	}
 
-	// `model` is an object upstream, not a string. It is only attached when the
-	// console supplies a template, because an empty object is rejected — and so
-	// is a guessed one: a synthesized {"id": ...} earned a 400 "invalid model
-	// selection" (1406010011) from the live upstream. The desktop client's model
-	// selector serialises to a shape nobody has captured yet; until that capture
-	// exists, the template is the only sanctioned way to fill this field, and
-	// chat entries serve the account's default model.
-	if template := strings.TrimSpace(settings.Upstream.ModelPayload); template != "" {
+	// `model` is an object upstream, not a string, and a synthesized
+	// {"id": ...} earned a 400 "invalid model selection" (1406010011) from the
+	// live upstream. The shape below is the client's own serialiser, read from
+	// the bundle (module 91766): provider_id, model_id, variant, thinking and
+	// context_limit, each omitted when it has no value.
+	//
+	// The console template still wins when one is configured: it was the only
+	// sanctioned way to fill this field before the shape was known, and an
+	// operator who set it meant it.
+	switch {
+	case strings.TrimSpace(settings.Upstream.ModelPayload) != "":
 		var parsed map[string]any
-		if err := json.Unmarshal([]byte(template), &parsed); err == nil {
+		if err := json.Unmarshal([]byte(settings.Upstream.ModelPayload), &parsed); err == nil {
 			body["model"] = parsed
 		}
+	case opts.Model != "":
+		selection := map[string]any{
+			"provider_id": upstreamProviderID,
+			"model_id":    opts.Model,
+		}
+		if opts.Variant != nil {
+			selection["variant"] = *opts.Variant
+		}
+		if opts.ContextLimit > 0 {
+			selection["context_limit"] = opts.ContextLimit
+		}
+		body["model"] = selection
 	}
 	if opts.Mode != "" {
 		body["mode"] = opts.Mode

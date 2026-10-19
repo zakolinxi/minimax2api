@@ -126,7 +126,7 @@ def main():
     check("GET /admin/models returns 200", status == 200)
     model_ids = {item["id"] for item in payload.get("items", [])}
     for expected in ("minimax-agent", "minimax-m3.1-flash", "minimax-m3",
-                     "minimax-m3-thinking", "minimax-image"):
+                     "minimax-image"):
         check(f"catalogue contains {expected}", expected in model_ids)
 
     status, payload = call(base, "/v1/models", token=key)

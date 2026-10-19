@@ -27,6 +27,14 @@ export type ModelDTO = {
   // because its limit has not been read, and the console does not pretend to
   // tell those apart.
   maxReferences?: number;
+  // The context window a chat model uses by default, and the sizes it lets a
+  // caller pick. Absent on entries with no model behind them and on models
+  // whose options have not been read.
+  contextLimit?: number;
+  contextWindows?: number[];
+  // The upstream's thinking_config.mode: forced_on, switchable or forced_off.
+  // Absent means the model has no thinking control at all.
+  thinkingMode?: string;
   enabled: boolean;
   builtin: boolean;
   description: string;
