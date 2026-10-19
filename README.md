@@ -213,9 +213,8 @@ curl http://127.0.0.1:8080/v1/messages \
 | 模型 ID | 类型 | 说明 |
 | --- | --- | --- |
 | `minimax-agent` | chat | 通用 Agent，自动规划并调用工具（默认） |
-| `minimax-m3.1-flash` | chat | 最新旗舰 Flash，强制思考，支持 `reasoning_effort` 档位 |
-| `minimax-m3` | chat | 上一代旗舰，思考可开关 |
-| `minimax-m3-thinking` | chat | 深度思考，推理内容走 `reasoning_content` |
+| `minimax-m3.1-flash` | chat | 最新旗舰 Flash，强制思考；上下文 **512K / 1M** |
+| `minimax-m3` | chat | 上一代旗舰，思考可开关；上下文 450K |
 | `minimax-image` | image | 图像生成 |
 | `minimax-h3` | video | H3.0，质量优先，消耗账号积分，**768P / 2K** |
 | `minimax-h3-max` | video | H3 Max，约 20 秒完成（唯一能同步返回的），**480P / 768P** |
@@ -229,9 +228,25 @@ curl http://127.0.0.1:8080/v1/messages \
 | `image` | ✅ 图片以 Markdown 回在正文里 | ✅ | — | — |
 | `video` | ✅ 整轮被改写成插件引用 | — | ✅ | — |
 
-> chat 类模型的 ID **最终打的都是同一个上游 Agent**，上游按账号默认模型回答——这些条目只是标签。上游模型选择器走在消息请求体里，可在「系统设置 → 上游 → `model` 字段模板」配置。
+> chat 类模型的 ID **最终打的都是同一个上游 Agent**，但条目现在会真的把上游模型名发出去（消息体里的 `model` 对象，`provider_id` + `model_id`）。上游模型选择器的形状取自客户端 bundle，不再是猜的；「系统设置 → 上游 → `model` 字段模板」仍然优先，配了就按模板发。
 >
 > 清单以上游 `/minimax-cloud/api/v1/config` 为准。M3.1-Flash 转正后 M2.7 / M2.7-highspeed 已从该接口消失，内置条目同步删除；**存量安装里残留的旧条目也会在启动时清掉**（有用量记录的同样清理——审计日志仍保留每次调用所用的模型与 token，不会丢历史）。
+
+### 思考与上下文
+
+思考不再是单独的模型，而是请求字段：上游的 `model.variant`。上下文窗口同理，走 `model.context_limit`。
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-mm-xxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"minimax-m3.1-flash","thinking":true,"context_window":1000000,
+       "messages":[{"role":"user","content":"你好"}]}'
+```
+
+- `thinking`（boolean）：`true` 开、`false` 关。`minimax-m3` 可开关；`minimax-m3.1-flash` 上游强制开启，传 `false` 也仍然会思考。不传则用上游默认。
+- `context_window`（number）：`minimax-m3.1-flash` 支持 `512000` / `1000000`，其它值**就近取整**而不是报错（1M 更费额度）；`minimax-m3` 只有 450000，传别的值会落回它。不传用模型默认。
+- `/v1/messages` 用 Anthropic 自己的写法：`"thinking":{"type":"enabled"}`，映射到同一个 `variant`。
 
 ### 视频生成
 

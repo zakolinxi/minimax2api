@@ -354,7 +354,8 @@ func TestChatCompletionsSeparatesReasoning(t *testing.T) {
 	h.addAccount(t, "primary", "token-good", 10)
 
 	rec := h.chat(t, map[string]any{
-		"model":    "minimax-m3-thinking",
+		"model":    "minimax-m3",
+		"thinking": true,
 		"messages": []any{map[string]any{"role": "user", "content": "6*7?"}},
 	}, h.key)
 
@@ -370,6 +371,79 @@ func TestChatCompletionsSeparatesReasoning(t *testing.T) {
 	}
 	if message["reasoning_content"] != "先想一下" {
 		t.Fatalf("reasoning_content = %v", message["reasoning_content"])
+	}
+}
+
+// captureUpstream records the message body and delegates everything else to the
+// standard stub.
+func captureUpstream(t *testing.T, into *map[string]any) http.HandlerFunc {
+	t.Helper()
+	stub := upstreamFunc(nil, func(string) string { return upstreamText("ok") })
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/message") {
+			raw, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(raw, into)
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+		}
+		stub(w, r)
+	}
+}
+
+// The model object is how thinking and the context window reach the upstream;
+// without it every request ran on the account's default and the catalogue's
+// 1M option was decoration.
+func TestChatCompletionsSendsTheModelSelection(t *testing.T) {
+	var captured map[string]any
+	h := newHarness(t, captureUpstream(t, &captured))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model":          "minimax-m3.1-flash",
+		"context_window": 900000,
+		"messages":       []any{map[string]any{"role": "user", "content": "hi"}},
+	}, h.key)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	selection, _ := captured["model"].(map[string]any)
+	if selection["provider_id"] != "minimax" || selection["model_id"] != "MiniMax-M3.1-Flash" {
+		t.Fatalf("model object = %v", captured["model"])
+	}
+	// 900k is nearer 1M than 512K. The repair is silent on a chat turn — there
+	// is nowhere in the answer to report it.
+	if selection["context_limit"] != float64(1000000) {
+		t.Errorf("context_limit = %v, want 1000000", selection["context_limit"])
+	}
+	// M3.1-Flash forces thinking, so the variant it actually runs with goes out
+	// even though the caller said nothing.
+	if selection["variant"] != "thinking" {
+		t.Errorf("variant = %v, want thinking", selection["variant"])
+	}
+}
+
+// A switchable model needs an explicit empty variant to turn thinking off; the
+// upstream default is on, so omitting the field would be the opposite of what
+// the caller asked for.
+func TestChatCompletionsTurnsThinkingOffOnSwitchableModel(t *testing.T) {
+	var captured map[string]any
+	h := newHarness(t, captureUpstream(t, &captured))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-m3",
+		"thinking": false,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, h.key)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	selection, _ := captured["model"].(map[string]any)
+	variant, present := selection["variant"]
+	if !present || variant != "" {
+		t.Errorf("variant = %v (present %v), want an explicit empty string", variant, present)
+	}
+	if _, ok := selection["context_limit"]; ok {
+		t.Errorf("context_limit was sent without being asked for: %v", selection["context_limit"])
 	}
 }
 
@@ -659,7 +733,7 @@ func TestModelsEndpoint(t *testing.T) {
 			t.Fatalf("entry object = %v", entry["object"])
 		}
 	}
-	for _, want := range []string{"minimax-agent", "minimax-m3-thinking", "minimax-image"} {
+	for _, want := range []string{"minimax-agent", "minimax-m3.1-flash", "minimax-image"} {
 		if !ids[want] {
 			t.Fatalf("model list is missing %s: %v", want, ids)
 		}

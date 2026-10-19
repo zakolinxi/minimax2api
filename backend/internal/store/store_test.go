@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -501,13 +502,10 @@ func TestMergeBuiltinModelsBackfillsUpstreamModel(t *testing.T) {
 	if got := modelByID(merged, "minimax-m3"); got.Requests != 7 {
 		t.Errorf("the merge reset usage counters: requests=%d", got.Requests)
 	}
-	// Entries that carry no upstream id stay that way — the agent and thinking
-	// entries have always served whatever the account defaults to.
+	// Entries that carry no upstream id stay that way — the agent entry has
+	// always served whatever the account defaults to.
 	if got := modelByID(merged, "minimax-agent").UpstreamModel; got != "" {
 		t.Errorf("minimax-agent grew an upstream id %q", got)
-	}
-	if got := modelByID(merged, "minimax-m3-thinking").UpstreamModel; got != "" {
-		t.Errorf("minimax-m3-thinking grew an upstream id %q", got)
 	}
 }
 
@@ -604,6 +602,60 @@ func TestMergeBuiltinModelsBackfillsTheReferenceCap(t *testing.T) {
 	}
 }
 
+// The context sizes and the thinking mode are upstream facts like the video
+// ranges, and they fail the same way when they do not reach an existing
+// install: silently. A frozen entry would answer every request at the default
+// window and refuse to offer 1M, with nothing on screen to say why.
+func TestMergeBuiltinModelsBackfillsContextAndThinking(t *testing.T) {
+	stored := BuiltinModels()
+	for _, model := range stored {
+		model.ContextLimit, model.ContextWindows, model.ThinkingMode = 0, nil, ""
+	}
+	merged, changed := MergeBuiltinModels(stored)
+	if !changed {
+		t.Fatal("a catalogue stripped of its context facts should report a change")
+	}
+	modelByID := func(id string) *ModelConfig {
+		for _, model := range merged {
+			if model.ID == id {
+				return model
+			}
+		}
+		return nil
+	}
+	flash := modelByID("minimax-m3.1-flash")
+	if flash == nil || flash.ContextLimit != 512000 {
+		t.Fatalf("M3.1-Flash default window = %v, want 512000", flash)
+	}
+	if got := strings.Join(intStrings(flash.ContextWindows), "/"); got != "512000/1000000" {
+		t.Errorf("M3.1-Flash windows = %s, want 512000/1000000", got)
+	}
+	if flash.ThinkingMode != "forced_on" {
+		t.Errorf("M3.1-Flash thinking = %q, want forced_on", flash.ThinkingMode)
+	}
+	m3 := modelByID("minimax-m3")
+	if m3 == nil || m3.ThinkingMode != "switchable" {
+		t.Fatalf("M3 thinking = %v, want switchable", m3)
+	}
+	// No options means no choice, which is a different state from "not read":
+	// the default still goes out, it just cannot be changed.
+	if len(m3.ContextWindows) != 0 {
+		t.Errorf("M3 grew windows %v", m3.ContextWindows)
+	}
+	// The agent entry has no model at all, so none of this applies to it.
+	if agent := modelByID("minimax-agent"); agent == nil || agent.ContextLimit != 0 || agent.ThinkingMode != "" {
+		t.Errorf("minimax-agent grew upstream facts: %+v", agent)
+	}
+}
+
+func intStrings(values []int) []string {
+	out := make([]string, len(values))
+	for index, value := range values {
+		out[index] = strconv.Itoa(value)
+	}
+	return out
+}
+
 // The two H3 variants differ in resolution and agree on everything else. That
 // difference is the whole reason the ranges are per model rather than global,
 // so it is pinned here: a request that is valid on one and not the other is the
@@ -644,10 +696,9 @@ func TestBuiltinVideoRangesDifferByResolutionOnly(t *testing.T) {
 // a client filling its picker from /v1/models can select each of them.
 func TestBuiltinModelsCoverTheUpstreamSelector(t *testing.T) {
 	want := map[string]string{
-		"minimax-agent":       "",
-		"minimax-m3.1-flash":  "MiniMax-M3.1-Flash",
-		"minimax-m3":          "MiniMax-M3",
-		"minimax-m3-thinking": "",
+		"minimax-agent":      "",
+		"minimax-m3.1-flash": "MiniMax-M3.1-Flash",
+		"minimax-m3":         "MiniMax-M3",
 	}
 	for _, model := range BuiltinModels() {
 		expected, ok := want[model.ID]
@@ -675,6 +726,7 @@ func TestMergeBuiltinModelsRetiresEntriesWithUsageToo(t *testing.T) {
 		{ID: "minimax-m2.7", Name: "MiniMax M2.7", Builtin: true, Enabled: true},
 		{ID: "minimax-m2.7-highspeed", Name: "MiniMax M2.7 HighSpeed", Builtin: true, Enabled: true, Requests: 3, Tokens: 1200},
 		{ID: "minimax-m3.1-flash-preview", Name: "MiniMax M3.1 Flash Preview", Builtin: true, Enabled: true},
+		{ID: "minimax-m3-thinking", Name: "MiniMax M3 Thinking", Builtin: true, Enabled: true, Requests: 9},
 	}
 	merged, changed := MergeBuiltinModels(stored)
 	if !changed {
@@ -684,7 +736,7 @@ func TestMergeBuiltinModelsRetiresEntriesWithUsageToo(t *testing.T) {
 	for _, model := range merged {
 		byID[model.ID] = model
 	}
-	for _, id := range []string{"minimax-m2.7", "minimax-m2.7-highspeed", "minimax-m3.1-flash-preview"} {
+	for _, id := range []string{"minimax-m2.7", "minimax-m2.7-highspeed", "minimax-m3.1-flash-preview", "minimax-m3-thinking"} {
 		if _, ok := byID[id]; ok {
 			t.Errorf("%s is retired upstream; it must not stay in the catalogue", id)
 		}

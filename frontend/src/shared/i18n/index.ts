@@ -329,6 +329,11 @@ const zhCN = {
     seconds: "秒",
     references: "参考图",
     referenceLimit: "最多 {{count}} 张",
+    context: "上下文",
+    thinking: "思考",
+    thinkingForced: "强制开启",
+    thinkingSwitchable: "可开关",
+    thinkingOff: "不支持",
   },
   audits: {
     title: "请求审计",
@@ -562,7 +567,11 @@ const zhCN = {
     healthDescription: "返回服务状态与号池概况。",
     stream: "流式",
     noteModel:
-      "minimax-agent（默认）、minimax-m3.1-flash、minimax-m3、minimax-m3-thinking，或 minimax-image —— 选图像模型时，图片以 Markdown 形式回在正文里",
+      "minimax-agent（默认）、minimax-m3.1-flash、minimax-m3，或 minimax-image —— 选图像模型时，图片以 Markdown 形式回在正文里",
+    noteThinking:
+      "是否开启思考（上游 model.variant）。M3 可开关，M3.1-Flash 强制开启；不传则用上游默认。",
+    noteContextWindow:
+      "上下文窗口（token）。M3.1-Flash 支持 512000 / 1000000，其它值会就近取整；不传用模型默认。",
     noteMessages: "OpenAI 标准消息数组，支持 text 与 image_url 多模态内容",
     noteStream: "是否使用 SSE 流式输出，默认 false",
     notePassthrough: "透传字段，上游不区分，仅用于兼容客户端",
@@ -921,6 +930,11 @@ const en: typeof zhCN = {
     seconds: "s",
     references: "References",
     referenceLimit: "up to {{count}}",
+    context: "Context",
+    thinking: "Thinking",
+    thinkingForced: "Forced on",
+    thinkingSwitchable: "Switchable",
+    thinkingOff: "Unsupported",
   },
   audits: {
     title: "Request audits",
@@ -1155,7 +1169,11 @@ const en: typeof zhCN = {
     healthDescription: "Returns service status and pool summary.",
     stream: "Streaming",
     noteModel:
-      "minimax-agent (default), minimax-m3.1-flash, minimax-m3, minimax-m3-thinking, or minimax-image — with an image model the pictures come back as Markdown in the message body",
+      "minimax-agent (default), minimax-m3.1-flash, minimax-m3, or minimax-image — with an image model the pictures come back as Markdown in the message body",
+    noteThinking:
+      "Turn thinking on or off (the upstream model variant). M3 can switch it; M3.1-Flash always thinks. Omit it to use the upstream default.",
+    noteContextWindow:
+      "Context window in tokens. M3.1-Flash offers 512000 and 1000000; any other value is snapped to the nearest one. Omit it for the model default.",
     noteMessages: "Standard OpenAI message array; text and image_url multimodal content are both supported",
     noteStream: "Use SSE streaming, default false",
     notePassthrough: "Passed through; the upstream does not distinguish it, and it exists for client compatibility",

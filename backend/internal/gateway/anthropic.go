@@ -34,6 +34,17 @@ type anthropicRequest struct {
 	Messages  []anthropicMessage `json:"messages"`
 	Stream    bool               `json:"stream"`
 	Tools     []anthropicTool    `json:"tools"`
+	// Thinking is Anthropic's own shape: {"type":"enabled"} or
+	// {"type":"disabled"}. It maps onto the upstream's thinking variant, which
+	// is the same knob under a different name.
+	Thinking anthropicThinking `json:"thinking"`
+	// ContextWindow has no Anthropic equivalent; it is accepted so a client can
+	// ask for 1M on M3.1-Flash without reaching for a different endpoint.
+	ContextWindow int `json:"context_window"`
+}
+
+type anthropicThinking struct {
+	Type string `json:"type"`
 }
 
 type anthropicMessage struct {
@@ -97,10 +108,16 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		prompt = injectTools(prompt, tools)
 	}
 
-	mode := ""
-	if model.ID == "minimax-m3-thinking" {
-		mode = "think"
+	var thinking *bool
+	switch request.Thinking.Type {
+	case "enabled":
+		on := true
+		thinking = &on
+	case "disabled":
+		off := false
+		thinking = &off
 	}
+	variant, contextLimit := modelSelection(model, thinking, request.ContextWindow)
 
 	settings := g.settings()
 	prompt = g.outgoingText(settings, model, prompt, minimax.VideoOptions{})
@@ -122,16 +139,17 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	turn, lastErr := g.runTurn(r.Context(), turnRequest{
-		Prompt:     prompt,
-		Images:     images,
-		Files:      files,
-		Mode:       mode,
-		Model:      model,
-		SessionKey: "",
-		Started:    started,
-		OnDelta:    onDelta,
-		OnThinking: onThinking,
-		Committed:  func() bool { return out.wroteHeader },
+		Prompt:       prompt,
+		Images:       images,
+		Files:        files,
+		Model:        model,
+		Variant:      variant,
+		ContextLimit: contextLimit,
+		SessionKey:   "",
+		Started:      started,
+		OnDelta:      onDelta,
+		OnThinking:   onThinking,
+		Committed:    func() bool { return out.wroteHeader },
 	})
 
 	promptTokens := estimateTokens(prompt)

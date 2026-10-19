@@ -19,6 +19,18 @@ const TYPE_TONE: Record<string, string> = {
   video: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
 };
 
+// formatContext renders a context window the way the model picker labels it:
+// 512000 becomes "512K", 1000000 becomes "1M". formatTokens is for counters and
+// would render "512.0K" here, which reads like a measurement rather than a size.
+function formatContext(value: number): string {
+  if (value >= 1_000_000) {
+    const millions = value / 1_000_000;
+    return `${Number.isInteger(millions) ? millions : millions.toFixed(1)}M`;
+  }
+  const thousands = value / 1_000;
+  return `${Number.isInteger(thousands) ? thousands : thousands.toFixed(0)}K`;
+}
+
 // formatDurations collapses a contiguous run into a range.
 //
 // The panel offers every whole second from 5 to 15, and "5-15s" says the same
@@ -34,11 +46,12 @@ function formatDurations(durations: number[], unit: string): string {
   return sorted.map((value) => `${value}${unit}`).join(" / ");
 }
 
-// ModelRanges shows what a video model accepts.
+// ModelRanges shows what a model accepts.
 //
 // The ranges are per model and they differ — the two H3 variants disagree about
 // resolution — so without this the only way to learn them is to make a call and
-// read the repair report. A model whose panel has not been read shows nothing
+// read the repair report. The same holds for a chat model's context window and
+// its thinking control. A model whose panel has not been read shows nothing
 // rather than an empty row, because "no ranges" means unenforced, not
 // "accepts nothing".
 function ModelRanges({ model }: { model: ModelDTO }) {
@@ -47,10 +60,35 @@ function ModelRanges({ model }: { model: ModelDTO }) {
   const ratios = model.ratios ?? [];
   const durations = model.durations ?? [];
   const maxReferences = model.maxReferences ?? 0;
-  if (resolutions.length === 0 && ratios.length === 0 && durations.length === 0 && maxReferences === 0) {
+  const contextWindows = model.contextWindows ?? [];
+  const contextLimit = model.contextLimit ?? 0;
+  const thinkingMode = model.thinkingMode ?? "";
+  if (
+    resolutions.length === 0 &&
+    ratios.length === 0 &&
+    durations.length === 0 &&
+    maxReferences === 0 &&
+    contextWindows.length === 0 &&
+    contextLimit === 0 &&
+    thinkingMode === ""
+  ) {
     return null;
   }
   const fields: Array<{ label: string; value: string }> = [];
+  if (contextWindows.length > 0) {
+    fields.push({ label: t("models.context"), value: contextWindows.map(formatContext).join(" / ") });
+  } else if (contextLimit > 0) {
+    fields.push({ label: t("models.context"), value: formatContext(contextLimit) });
+  }
+  if (thinkingMode !== "") {
+    const key =
+      thinkingMode === "forced_on"
+        ? "models.thinkingForced"
+        : thinkingMode === "forced_off"
+          ? "models.thinkingOff"
+          : "models.thinkingSwitchable";
+    fields.push({ label: t("models.thinking"), value: t(key) });
+  }
   if (resolutions.length > 0) {
     fields.push({ label: t("models.resolutions"), value: resolutions.join(" / ") });
   }

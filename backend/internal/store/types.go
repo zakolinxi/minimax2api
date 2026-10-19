@@ -303,13 +303,27 @@ type ModelConfig struct {
 	// purpose: a model that takes any number, and a model whose limit has not
 	// been read. Both are "the gateway will not refuse anything here", and that
 	// is the only thing this field decides.
-	MaxReferences int    `json:"maxReferences,omitempty"`
-	Type          string `json:"type"`
-	Enabled       bool   `json:"enabled"`
-	Builtin       bool   `json:"builtin"`
-	Description   string `json:"description"`
-	Requests      int64  `json:"requests"`
-	Tokens        int64  `json:"tokens"`
+	MaxReferences int `json:"maxReferences,omitempty"`
+	// ContextLimit is the context window the upstream uses when the caller
+	// asks for nothing, and ContextWindows are the sizes it lets a caller pick.
+	//
+	// Both are facts about the upstream, like the video ranges: the config
+	// endpoint reports `context_limit` and `context_window_options`, and a
+	// request that names one of the options travels as `context_limit` in the
+	// body's model object. Empty ContextWindows means there is no choice —
+	// either the model offers one size or its options have not been read.
+	ContextLimit   int   `json:"contextLimit,omitempty"`
+	ContextWindows []int `json:"contextWindows,omitempty"`
+	// ThinkingMode mirrors the upstream's `thinking_config.mode`: "forced_on",
+	// "switchable" or "forced_off". Empty means the model has no thinking
+	// control and the gateway sends no variant for it.
+	ThinkingMode string `json:"thinkingMode,omitempty"`
+	Type         string `json:"type"`
+	Enabled      bool   `json:"enabled"`
+	Builtin      bool   `json:"builtin"`
+	Description  string `json:"description"`
+	Requests     int64  `json:"requests"`
+	Tokens       int64  `json:"tokens"`
 }
 
 type State struct {
@@ -333,8 +347,10 @@ type State struct {
 // a video entry writes it into the generation-options block, while the chat
 // body's `model` object is filled from the console's template, because the
 // selector's own serialisation has never been captured; see buildMessageBody.
-// An entry without an id — `minimax-agent`, `minimax-m3-thinking` — sends no
-// model field at all, exactly as every build before the selector did.
+// An entry without an id — `minimax-agent` — sends no model field at all,
+// exactly as every build before the selector did. Thinking is no longer an
+// entry of its own: it is the `thinking` request field, carried as the model
+// object's `variant` (see thinkingVariant in the gateway).
 //
 // The ids below are the ones that endpoint currently lists
 // (`MiniMax-M3.1-Flash`, `MiniMax-M3`). It is authoritative in both directions:
@@ -359,15 +375,19 @@ func BuiltinModels() []*ModelConfig {
 			ID: "minimax-m3.1-flash", Name: "MiniMax M3.1 Flash", Upstream: "chat",
 			UpstreamModel: "MiniMax-M3.1-Flash", Type: ModelTypeChat,
 			Enabled: true, Builtin: true,
-			Description: "最新旗舰 Flash，强制思考；支持 reasoning_effort 档位",
+			// The upstream's own picker offers 512K and 1M, with 1M flagged
+			// "higher_usage". Thinking is forced on for this model, so there is
+			// no toggle to honour — a caller asking for it off still gets it on.
+			ContextLimit: 512000, ContextWindows: []int{512000, 1000000}, ThinkingMode: "forced_on",
+			Description: "最新旗舰 Flash，强制思考；上下文 512K，可切 1M（更费额度）",
 		},
 		{
 			ID: "minimax-m3", Name: "MiniMax M3", Upstream: "chat", UpstreamModel: "MiniMax-M3", Type: ModelTypeChat,
-			Enabled: true, Builtin: true, Description: "上一代旗舰，思考可开关",
-		},
-		{
-			ID: "minimax-m3-thinking", Name: "MiniMax M3 Thinking", Upstream: "think", Type: ModelTypeChat,
-			Enabled: true, Builtin: true, Description: "深度思考模式，附带推理内容",
+			Enabled: true, Builtin: true,
+			// Switchable, defaulting to on upstream; the gateway sends an
+			// explicit variant so `thinking:false` can actually turn it off.
+			ContextLimit: 450000, ThinkingMode: "switchable",
+			Description: "上一代旗舰，思考可开关（`thinking`）",
 		},
 		{
 			ID: "minimax-image", Name: "MiniMax Image", Upstream: "image", Type: ModelTypeImage,
@@ -434,6 +454,11 @@ var retiredBuiltinModels = map[string]struct{}{
 	"minimax-m2.7":               {},
 	"minimax-m2.7-highspeed":     {},
 	"minimax-m3.1-flash-preview": {},
+	// Thinking stopped being a model and became the `thinking` request field.
+	// Keeping the entry would offer a second name for the same model, and the
+	// old id carried no model of its own — it only asked the adapter to surface
+	// the reasoning stream.
+	"minimax-m3-thinking": {},
 }
 
 // MergeBuiltinModels adds any built-in entry the stored catalogue is missing,
@@ -525,6 +550,22 @@ func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
 		// adoption only ever installs a cap the built-in already declares.
 		if model.MaxReferences == 0 && builtin.MaxReferences > 0 {
 			model.MaxReferences = builtin.MaxReferences
+			changed = true
+		}
+		// Same argument as the video ranges: an install that froze the
+		// catalogue before these fields existed would otherwise keep answering
+		// with the upstream default and refuse to offer 1M, with nothing on
+		// screen saying why.
+		if model.ContextLimit == 0 && builtin.ContextLimit > 0 {
+			model.ContextLimit = builtin.ContextLimit
+			changed = true
+		}
+		if len(model.ContextWindows) == 0 && len(builtin.ContextWindows) > 0 {
+			model.ContextWindows = builtin.ContextWindows
+			changed = true
+		}
+		if model.ThinkingMode == "" && builtin.ThinkingMode != "" {
+			model.ThinkingMode = builtin.ThinkingMode
 			changed = true
 		}
 	}

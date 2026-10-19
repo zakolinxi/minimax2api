@@ -84,6 +84,15 @@ type chatRequest struct {
 	Stream   bool          `json:"stream"`
 	User     string        `json:"user"`
 	Tools    []toolSpec    `json:"tools"`
+	// Thinking turns the reasoning variant on or off. It is a request field
+	// rather than a catalogue entry because that is what it is upstream: a
+	// `variant` value on the model object, not a different model. Nil means the
+	// caller said nothing and the upstream default applies.
+	Thinking *bool `json:"thinking"`
+	// ContextWindow asks for a context size in tokens. It is repaired to the
+	// nearest size the model offers rather than rejected; zero means "no
+	// preference" and sends nothing.
+	ContextWindow int `json:"context_window"`
 }
 
 type chatMessage struct {
@@ -182,14 +191,11 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Every catalogue entry reaches the same upstream agent, so the model id is
-	// not forwarded. It only steers local behaviour: the thinking variant asks
-	// the adapter to surface the reasoning stream, and a video entry rewrites the
-	// turn into a plugin reference with its generation parameters attached.
-	mode := ""
-	if model.ID == "minimax-m3-thinking" {
-		mode = "think"
-	}
+	// Every catalogue entry reaches the same upstream agent, so the entry itself
+	// is not a routing decision — but it does name a model now. `thinking` and
+	// `context_window` are the two knobs the upstream's model object carries,
+	// and both are repaired here rather than rejected (see modelSelection).
+	variant, contextLimit := modelSelection(model, request.Thinking, request.ContextWindow)
 
 	settings := g.settings()
 	prompt = g.outgoingText(settings, model, prompt, minimax.VideoOptions{})
@@ -231,16 +237,17 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	turn, lastErr := g.runTurn(r.Context(), turnRequest{
-		Prompt:     prompt,
-		Images:     images,
-		Files:      files,
-		Mode:       mode,
-		Model:      model,
-		SessionKey: request.User,
-		Started:    started,
-		OnDelta:    onDelta,
-		OnThinking: onThinking,
-		Committed:  func() bool { return out.wroteHeader },
+		Prompt:       prompt,
+		Images:       images,
+		Files:        files,
+		Model:        model,
+		Variant:      variant,
+		ContextLimit: contextLimit,
+		SessionKey:   request.User,
+		Started:      started,
+		OnDelta:      onDelta,
+		OnThinking:   onThinking,
+		Committed:    func() bool { return out.wroteHeader },
 	})
 
 	accountName := turn.AccountName
@@ -340,15 +347,16 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 // turnRequest is one call to the upstream: what to send, which pool to draw
 // from, and how deltas leave.
 type turnRequest struct {
-	Prompt     string
-	Images     []minimax.UploadedImage
-	Files      []minimax.PendingAttachment
-	Mode       string
-	Model      *store.ModelConfig
-	SessionKey string
-	Started    time.Time
-	OnDelta    func(string)
-	OnThinking func(string)
+	Prompt       string
+	Images       []minimax.UploadedImage
+	Files        []minimax.PendingAttachment
+	Model        *store.ModelConfig
+	Variant      *string
+	ContextLimit int
+	SessionKey   string
+	Started      time.Time
+	OnDelta      func(string)
+	OnThinking   func(string)
 	// Committed reports whether the response has already begun. A retry is only
 	// safe while nothing has been written: once the caller has seen a byte, a
 	// second account would append a second answer to the first.
@@ -402,13 +410,15 @@ func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, er
 		}
 
 		opts := minimax.Options{
-			Credential:  CredentialOf(lease.Account),
-			Text:        req.Prompt,
-			Mode:        req.Mode,
-			Images:      req.Images,
-			Files:       req.Files,
-			Timeout:     timeoutFor(settings, req.Model),
-			IdleTimeout: settings.StreamIdleTimeout(),
+			Credential:   CredentialOf(lease.Account),
+			Text:         req.Prompt,
+			Model:        req.Model.UpstreamModel,
+			Variant:      req.Variant,
+			ContextLimit: req.ContextLimit,
+			Images:       req.Images,
+			Files:        req.Files,
+			Timeout:      timeoutFor(settings, req.Model),
+			IdleTimeout:  settings.StreamIdleTimeout(),
 		}
 		if req.OnDelta != nil {
 			opts.OnDelta = func(text string) {
@@ -764,6 +774,68 @@ func referenceLimit(model *store.ModelConfig, count int) (int, []minimax.Adjustm
 		return cap, []minimax.Adjustment{minimax.ReferenceAdjustment(count, cap)}
 	}
 	return count, nil
+}
+
+// modelSelection turns a request's thinking and context wishes into the two
+// values the message body's model object carries.
+//
+// Thinking is a request field now, not a catalogue entry: upstream it is a
+// `variant` on the model object, and "thinking" is one of its values. A model
+// that forces thinking on cannot honour `false`, so the gateway asks for the
+// only variant it has instead of sending a value the upstream would reject; a
+// model with no thinking control gets no variant at all.
+//
+// Context is repaired rather than rejected, the same rule the video ranges
+// follow: the caller's number is snapped to the nearest size the model offers.
+// Zero means "no preference" and stays zero, which omits the field and leaves
+// the upstream default in place.
+func modelSelection(model *store.ModelConfig, thinking *bool, contextWindow int) (*string, int) {
+	var variant *string
+	switch model.ThinkingMode {
+	case "forced_on":
+		on := "thinking"
+		variant = &on
+	case "switchable":
+		if thinking != nil {
+			value := ""
+			if *thinking {
+				value = "thinking"
+			}
+			variant = &value
+		}
+	case "forced_off":
+		off := ""
+		variant = &off
+	}
+	if contextWindow <= 0 {
+		return variant, 0
+	}
+	if len(model.ContextWindows) > 0 {
+		return variant, nearestInt(model.ContextWindows, contextWindow)
+	}
+	if model.ContextLimit > 0 {
+		return variant, model.ContextLimit
+	}
+	return variant, 0
+}
+
+// nearestInt picks the closest value in values, which the callers guarantee is
+// non-empty and ordered by nothing in particular.
+func nearestInt(values []int, want int) int {
+	best := values[0]
+	for _, value := range values[1:] {
+		if distance(value, want) < distance(best, want) {
+			best = value
+		}
+	}
+	return best
+}
+
+func distance(a, b int) int {
+	if a > b {
+		return a - b
+	}
+	return b - a
 }
 
 // imageName derives a filename from a URL, falling back to a stable default.
