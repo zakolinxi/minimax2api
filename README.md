@@ -213,10 +213,9 @@ curl http://127.0.0.1:8080/v1/messages \
 | 模型 ID | 类型 | 说明 |
 | --- | --- | --- |
 | `minimax-agent` | chat | 通用 Agent，自动规划并调用工具（默认） |
-| `minimax-m3.1-flash-preview` | chat | 预览版，支持 `reasoning_effort` 档位 |
-| `minimax-m3` | chat | 对话模式，响应更快 |
+| `minimax-m3.1-flash` | chat | 最新旗舰 Flash，强制思考，支持 `reasoning_effort` 档位 |
+| `minimax-m3` | chat | 上一代旗舰，思考可开关 |
 | `minimax-m3-thinking` | chat | 深度思考，推理内容走 `reasoning_content` |
-| `minimax-m2.7` / `minimax-m2.7-highspeed` | chat | 上一代对话模型及其高速版 |
 | `minimax-image` | image | 图像生成 |
 | `minimax-h3` | video | H3.0，质量优先，消耗账号积分，**768P / 2K** |
 | `minimax-h3-max` | video | H3 Max，约 20 秒完成（唯一能同步返回的），**480P / 768P** |
@@ -231,6 +230,8 @@ curl http://127.0.0.1:8080/v1/messages \
 | `video` | ✅ 整轮被改写成插件引用 | — | ✅ | — |
 
 > chat 类模型的 ID **最终打的都是同一个上游 Agent**，上游按账号默认模型回答——这些条目只是标签。上游模型选择器走在消息请求体里，可在「系统设置 → 上游 → `model` 字段模板」配置。
+>
+> 清单以上游 `/minimax-cloud/api/v1/config` 为准。M3.1-Flash 转正后 M2.7 / M2.7-highspeed 已从该接口消失，内置条目同步删除；存量安装里**从未被调用过**的旧条目会在启动时清掉，有用量记录的保留（可在控制台停用），避免改写历史统计。
 
 ### 视频生成
 

@@ -562,7 +562,7 @@ const zhCN = {
     healthDescription: "返回服务状态与号池概况。",
     stream: "流式",
     noteModel:
-      "minimax-agent（默认）、minimax-m3.1-flash-preview、minimax-m3、minimax-m3-thinking、minimax-m2.7、minimax-m2.7-highspeed，或 minimax-image —— 选图像模型时，图片以 Markdown 形式回在正文里",
+      "minimax-agent（默认）、minimax-m3.1-flash、minimax-m3、minimax-m3-thinking，或 minimax-image —— 选图像模型时，图片以 Markdown 形式回在正文里",
     noteMessages: "OpenAI 标准消息数组，支持 text 与 image_url 多模态内容",
     noteStream: "是否使用 SSE 流式输出，默认 false",
     notePassthrough: "透传字段，上游不区分，仅用于兼容客户端",
@@ -1155,7 +1155,7 @@ const en: typeof zhCN = {
     healthDescription: "Returns service status and pool summary.",
     stream: "Streaming",
     noteModel:
-      "minimax-agent (default), minimax-m3.1-flash-preview, minimax-m3, minimax-m3-thinking, minimax-m2.7, minimax-m2.7-highspeed, or minimax-image — with an image model the pictures come back as Markdown in the message body",
+      "minimax-agent (default), minimax-m3.1-flash, minimax-m3, minimax-m3-thinking, or minimax-image — with an image model the pictures come back as Markdown in the message body",
     noteMessages: "Standard OpenAI message array; text and image_url multimodal content are both supported",
     noteStream: "Use SSE streaming, default false",
     notePassthrough: "Passed through; the upstream does not distinguish it, and it exists for client compatibility",

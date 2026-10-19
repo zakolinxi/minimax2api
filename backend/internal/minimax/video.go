@@ -12,7 +12,7 @@ import (
 //
 // The conversation API has no way to select H3: `GET /minimax-cloud/api/v1/config`
 // returns the authoritative model list and it contains only the chat models
-// (MiniMax-M3, MiniMax-M2.7, MiniMax-M2.7-highspeed). H3 lives behind the
+// (MiniMax-M3.1-Flash, MiniMax-M3). H3 lives behind the
 // `video-creater` plugin, and there is no video endpoint in the web bundle
 // either — generation is submitted by the agent's own server-side Connector
 // tool (`connector__matrix__submit_video_generation`), which a client never
