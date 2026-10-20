@@ -387,3 +387,26 @@ func TestTheTwoFingerprintFieldsAreNotInterchangeable(t *testing.T) {
 		t.Errorf("the uuid %q parses as a number; the two fields have different shapes", uuid)
 	}
 }
+
+// A client key's concurrency is either a positive ceiling or unlimited, and
+// zero is how the console asks for the latter. Clamping zero up to one — the
+// old behaviour — left no way to create an unrestricted key at all.
+func TestConcurrencyLimitKeepsZeroAsUnlimited(t *testing.T) {
+	cases := []struct {
+		name  string
+		value int
+		want  int
+	}{
+		{"unlimited", 0, 0},
+		{"negative is also unlimited", -1, 0},
+		{"a real ceiling", 8, 8},
+		{"the upper bound still applies", 4096, 256},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := concurrencyLimit(tc.value); got != tc.want {
+				t.Fatalf("concurrencyLimit(%d) = %d, want %d", tc.value, got, tc.want)
+			}
+		})
+	}
+}
