@@ -79,7 +79,7 @@ TableCell.displayName = "TableCell";
 
 const TableActionHead = React.forwardRef<HTMLTableCellElement, React.ThHTMLAttributes<HTMLTableCellElement>>(
   ({ className, ...props }, ref) => (
-    <TableHead ref={ref} className={cn("sticky right-0 z-20 w-12 min-w-12 bg-background px-2", className)} {...props} />
+    <TableHead ref={ref} className={cn("sticky right-0 z-20 w-12 min-w-12 border-l border-border/60 bg-background px-2", className)} {...props} />
   ),
 );
 TableActionHead.displayName = "TableActionHead";
@@ -89,7 +89,7 @@ const TableActionCell = React.forwardRef<HTMLTableCellElement, React.TdHTMLAttri
     <TableCell
       ref={ref}
       className={cn(
-        "sticky right-0 z-10 w-12 min-w-12 bg-background px-2 transition-colors group-hover:bg-[color-mix(in_oklab,var(--secondary)_45%,var(--background))] group-data-[state=selected]:bg-secondary",
+        "sticky right-0 z-10 w-12 min-w-12 border-l border-border/60 bg-background px-2 transition-colors group-hover:bg-[color-mix(in_oklab,var(--secondary)_45%,var(--background))] group-data-[state=selected]:bg-secondary",
         className,
       )}
       {...props}

@@ -220,7 +220,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \\
     request: `curl http://127.0.0.1:8080/health`,
     response: `{
   "status": "ok",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "pool": { "total": 12, "available": 10, "cooldown": 1, "invalid": 1 }
 }`,
     parameters: [],
@@ -288,11 +288,11 @@ export function ApiDocsPage() {
           <div className="mt-4">
             <h3 className="text-xs font-medium">{t("docs.parameters")}</h3>
             <div className="mt-2 overflow-x-auto">
-              <table className="w-full text-xs">
+              <table className="w-full text-xs md:min-w-[560px]">
                 <thead>
                   <tr className="border-b text-muted-foreground">
                     <th className="h-8 px-2 text-left font-normal">{t("docs.parameter")}</th>
-                    <th className="h-8 px-2 text-left font-normal">{t("docs.parameterType")}</th>
+                    <th className="hidden h-8 px-2 text-left font-normal md:table-cell">{t("docs.parameterType")}</th>
                     <th className="h-8 px-2 text-left font-normal">{t("docs.required")}</th>
                     <th className="h-8 px-2 text-left font-normal">{t("docs.parameterNote")}</th>
                   </tr>
@@ -301,7 +301,7 @@ export function ApiDocsPage() {
                   {doc.parameters.map((parameter) => (
                     <tr key={parameter.name} className="border-b last:border-0">
                       <td className="px-2 py-2 font-mono">{parameter.name}</td>
-                      <td className="px-2 py-2 text-muted-foreground">{parameter.type}</td>
+                      <td className="hidden px-2 py-2 text-muted-foreground md:table-cell">{parameter.type}</td>
                       <td className="px-2 py-2 text-muted-foreground">{parameter.required ? t("docs.required") : "—"}</td>
                       <td className="px-2 py-2 text-muted-foreground">{parameter.noteKey ? t(parameter.noteKey) : "—"}</td>
                     </tr>

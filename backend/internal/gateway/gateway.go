@@ -24,7 +24,7 @@ import (
 )
 
 // Version is reported by /health.
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 // Gateway exposes the OpenAI-compatible surface.
 type Gateway struct {

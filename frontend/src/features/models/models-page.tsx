@@ -148,15 +148,15 @@ export function ModelsPage() {
         ) : items.length === 0 ? (
           <EmptyState label={t("common.empty")} />
         ) : (
-          <Table>
+          <Table className="md:min-w-[800px]">
             <TableHeader>
               <TableRow>
                 <TableHead>{t("models.modelId")}</TableHead>
-                <TableHead>{t("models.upstream")}</TableHead>
-                <TableHead className="text-center">{t("models.type")}</TableHead>
+                <TableHead className="hidden md:table-cell">{t("models.upstream")}</TableHead>
+                <TableHead className="hidden text-center md:table-cell">{t("models.type")}</TableHead>
                 <TableHead>{t("models.displayName")}</TableHead>
-                <TableHead className="text-center">{t("models.requests")}</TableHead>
-                <TableHead className="text-center">{t("models.tokens")}</TableHead>
+                <TableHead className="hidden text-center md:table-cell">{t("models.requests")}</TableHead>
+                <TableHead className="hidden text-center md:table-cell">{t("models.tokens")}</TableHead>
                 <TableHead className="text-center">{t("models.status")}</TableHead>
               </TableRow>
             </TableHeader>
@@ -164,8 +164,8 @@ export function ModelsPage() {
               {items.map((model) => (
                 <TableRow key={model.id}>
                   <TableCell className="font-mono text-xs">{model.id}</TableCell>
-                  <TableCell className="font-mono text-[11px] text-muted-foreground">{model.upstream}</TableCell>
-                  <TableCell className="text-center">
+                  <TableCell className="hidden font-mono text-[11px] text-muted-foreground md:table-cell">{model.upstream}</TableCell>
+                  <TableCell className="hidden text-center md:table-cell">
                     <span className={`inline-flex h-5 items-center rounded-full px-2 text-[11px] leading-none ${TYPE_TONE[model.type] ?? ""}`}>
                       {model.type === "chat" ? t("models.typeChat") : model.type === "image" ? t("models.typeImage") : t("models.typeVideo")}
                     </span>
@@ -175,11 +175,11 @@ export function ModelsPage() {
                     <p className="mt-0.5 text-[10px] text-muted-foreground">{model.description}</p>
                     <ModelRanges model={model} />
                   </TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">{formatNumber(model.requests, i18n.language)}</TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">{formatTokens(model.tokens, i18n.language)}</TableCell>
+                  <TableCell className="hidden text-center text-xs tabular-nums md:table-cell">{formatNumber(model.requests, i18n.language)}</TableCell>
+                  <TableCell className="hidden text-center text-xs tabular-nums md:table-cell">{formatTokens(model.tokens, i18n.language)}</TableCell>
                   <TableCell>
                     <div className="flex items-center justify-center gap-2">
-                      {model.builtin ? <Badge variant="outline">{t("models.builtin")}</Badge> : null}
+                      {model.builtin ? <Badge variant="outline" className="hidden whitespace-nowrap md:inline-flex">{t("models.builtin")}</Badge> : null}
                       <Switch
                         checked={model.enabled}
                         onCheckedChange={(enabled) => updateMutation.mutate({ id: model.id, enabled })}

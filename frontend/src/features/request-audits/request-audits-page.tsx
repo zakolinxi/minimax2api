@@ -130,17 +130,17 @@ export function RequestAuditsPage() {
         ) : items.length === 0 ? (
           <EmptyState label={t("common.empty")} />
         ) : (
-          <Table>
+          <Table className="md:min-w-[900px]">
             <TableHeader>
               <TableRow>
                 <TableHead className="whitespace-nowrap">{t("audits.time")}</TableHead>
                 <TableHead>{t("audits.model")}</TableHead>
-                <TableHead>{t("audits.key")}</TableHead>
-                <TableHead>{t("audits.account")}</TableHead>
+                <TableHead className="hidden md:table-cell">{t("audits.key")}</TableHead>
+                <TableHead className="hidden md:table-cell">{t("audits.account")}</TableHead>
                 <TableHead className="text-center">{t("audits.status")}</TableHead>
-                <TableHead className="text-center">{t("audits.latency")}</TableHead>
-                <TableHead className="text-center">{t("audits.firstToken")}</TableHead>
-                <TableHead className="text-center">{t("audits.tokens")}</TableHead>
+                <TableHead className="hidden text-center md:table-cell">{t("audits.latency")}</TableHead>
+                <TableHead className="hidden text-center md:table-cell">{t("audits.firstToken")}</TableHead>
+                <TableHead className="hidden text-center md:table-cell">{t("audits.tokens")}</TableHead>
                 <TableActionHead />
               </TableRow>
             </TableHeader>
@@ -151,14 +151,14 @@ export function RequestAuditsPage() {
                     {formatDateTime(item.createdAt, i18n.language)}
                   </TableCell>
                   <TableCell className="text-xs">{item.model}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{item.keyName || "—"}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{item.accountName || "—"}</TableCell>
+                  <TableCell className="hidden text-xs text-muted-foreground md:table-cell">{item.keyName || "—"}</TableCell>
+                  <TableCell className="hidden text-xs text-muted-foreground md:table-cell">{item.accountName || "—"}</TableCell>
                   <TableCell className="text-center">
                     <Badge variant={item.status < 400 ? "default" : "destructive"}>{item.status}</Badge>
                   </TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">{formatDuration(item.latencyMs)}</TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">{formatDuration(item.firstTokenMs)}</TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">
+                  <TableCell className="hidden text-center text-xs tabular-nums md:table-cell">{formatDuration(item.latencyMs)}</TableCell>
+                  <TableCell className="hidden text-center text-xs tabular-nums md:table-cell">{formatDuration(item.firstTokenMs)}</TableCell>
+                  <TableCell className="hidden text-center text-xs tabular-nums md:table-cell">
                     {formatTokens(item.promptTokens + item.completionTokens, i18n.language)}
                   </TableCell>
                   <TableActionCell>

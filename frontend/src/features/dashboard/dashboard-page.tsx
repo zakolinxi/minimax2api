@@ -96,7 +96,7 @@ function DashboardOverview({ dashboard, loading }: { dashboard?: DashboardDTO; l
 
   return (
     <section aria-label={t("dashboard.usage")}>
-      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+      <div className="grid grid-cols-2 gap-2 xl:grid-cols-5">
         <DashboardMetric
           icon={UsersRound}
           label={t("dashboard.accountCount")}
@@ -155,12 +155,12 @@ function DashboardMetric({
   loading: boolean;
 }) {
   return (
-    <article className="min-h-28 rounded-lg bg-card p-4" aria-busy={loading}>
-      <header className="flex min-h-5 items-center justify-between gap-3">
-        <span className="text-xs text-muted-foreground">{label}</span>
+    <article className="min-h-28 rounded-lg bg-card p-3 sm:p-4" aria-busy={loading}>
+      <header className="flex min-h-5 items-center justify-between gap-2">
+        <span className="truncate text-xs text-muted-foreground">{label}</span>
         <Icon className="size-4 shrink-0 text-muted-foreground" />
       </header>
-      <div className="mt-3 flex min-h-8 items-center text-2xl font-medium tracking-tight tabular-nums">
+      <div className="mt-2 flex min-h-8 items-center text-xl font-medium tracking-tight tabular-nums sm:mt-3 sm:text-2xl">
         {loading ? <Spinner /> : value}
       </div>
       <p className={cn("mt-1.5 min-h-4 truncate text-[11px] text-muted-foreground", loading && "invisible")} title={detail}>
