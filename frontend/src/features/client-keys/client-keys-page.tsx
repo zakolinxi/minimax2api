@@ -149,24 +149,24 @@ export function ClientKeysPage() {
         ) : items.length === 0 ? (
           <EmptyState label={t("common.empty")} />
         ) : (
-          <Table>
+          <Table className="md:min-w-[840px]">
             <TableHeader>
               <TableRow>
                 <TableHead>{t("clientKeys.name")}</TableHead>
                 <TableHead>{t("clientKeys.key")}</TableHead>
                 <TableHead className="text-center">{t("clientKeys.status")}</TableHead>
-                <TableHead className="text-center">{t("clientKeys.rpm")}</TableHead>
-                <TableHead className="text-center">{t("clientKeys.maxConcurrent")}</TableHead>
-                <TableHead className="text-center">{t("clientKeys.totalRequests")}</TableHead>
-                <TableHead className="whitespace-nowrap">{t("clientKeys.createdAt")}</TableHead>
-                <TableHead className="whitespace-nowrap">{t("clientKeys.lastUsed")}</TableHead>
+                <TableHead className="hidden text-center md:table-cell">{t("clientKeys.rpm")}</TableHead>
+                <TableHead className="hidden whitespace-nowrap text-center md:table-cell">{t("clientKeys.maxConcurrent")}</TableHead>
+                <TableHead className="hidden text-center md:table-cell">{t("clientKeys.totalRequests")}</TableHead>
+                <TableHead className="hidden whitespace-nowrap md:table-cell">{t("clientKeys.createdAt")}</TableHead>
+                <TableHead className="hidden whitespace-nowrap md:table-cell">{t("clientKeys.lastUsed")}</TableHead>
                 <TableActionHead />
               </TableRow>
             </TableHeader>
             <TableBody>
               {items.map((item) => (
                 <TableRow key={item.id}>
-                  <TableCell className="text-xs font-medium">{item.name}</TableCell>
+                  <TableCell className="whitespace-nowrap text-xs font-medium">{item.name}</TableCell>
                   <TableCell>
                     <button
                       type="button"
@@ -179,21 +179,21 @@ export function ClientKeysPage() {
                     </button>
                   </TableCell>
                   <TableCell className="text-center">
-                    <Badge variant={item.enabled ? "default" : "secondary"} className={cn(!item.enabled && "text-muted-foreground")}>
+                    <Badge variant={item.enabled ? "default" : "secondary"} className={cn("whitespace-nowrap", !item.enabled && "text-muted-foreground")}>
                       {item.enabled ? t("clientKeys.statusActive") : t("clientKeys.statusDisabled")}
                     </Badge>
                   </TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">
+                  <TableCell className="hidden text-center text-xs tabular-nums md:table-cell">
                     {item.rpmLimit > 0 ? item.rpmLimit : t("clientKeys.unlimited")}
                   </TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">
+                  <TableCell className="hidden whitespace-nowrap text-center text-xs tabular-nums md:table-cell">
                     {item.maxConcurrent > 0 ? item.maxConcurrent : t("clientKeys.unlimited")}
                   </TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">{formatNumber(item.totalRequests, i18n.language)}</TableCell>
-                  <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+                  <TableCell className="hidden text-center text-xs tabular-nums md:table-cell">{formatNumber(item.totalRequests, i18n.language)}</TableCell>
+                  <TableCell className="hidden whitespace-nowrap text-xs text-muted-foreground md:table-cell">
                     {formatDateTime(item.createdAt, i18n.language)}
                   </TableCell>
-                  <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+                  <TableCell className="hidden whitespace-nowrap text-xs text-muted-foreground md:table-cell">
                     {/* formatDateTime renders "—" for the Go zero time. */}
                     {formatDateTime(item.lastUsedAt, i18n.language)}
                   </TableCell>

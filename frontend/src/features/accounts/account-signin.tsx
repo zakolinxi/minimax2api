@@ -117,7 +117,7 @@ export function AccountCreditCell({ account, enforced }: { account: AccountDTO; 
         {credit.total}
       </span>
       {credit.total > 0 ? (
-        <p className="text-[10px] text-muted-foreground tabular-nums">
+        <p className="hidden text-[10px] text-muted-foreground tabular-nums md:block">
           {t("accounts.creditBreakdown", { free: credit.free, purchased: credit.purchased })}
         </p>
       ) : null}

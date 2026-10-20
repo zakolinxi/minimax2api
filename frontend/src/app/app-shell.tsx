@@ -265,10 +265,13 @@ export function AppShell() {
 
       <div className="flex min-h-screen flex-col lg:pl-[288px]">
         <header className="sticky top-0 z-40 flex h-12 items-center justify-between border-b bg-background px-4 lg:hidden">
+          {/* The trigger sits outside Sheet on purpose: Sheet returns null while
+              closed, so a button passed in as its child disappears with it and
+              the phone layout loses its only way into the navigation. */}
+          <Button variant="ghost" size="icon" className="size-8" aria-label={t("shell.openNavigation")} onClick={() => setMobileOpen(true)}>
+            <Menu className="size-4" />
+          </Button>
           <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
-            <Button variant="ghost" size="icon" className="size-8" aria-label={t("shell.openNavigation")} onClick={() => setMobileOpen(true)}>
-              <Menu className="size-4" />
-            </Button>
             <SheetContent className="px-3 py-4" onClose={() => setMobileOpen(false)}>
               <SheetHeader className="h-7 shrink-0 px-2.5 text-left">
                 <SheetTitle className="flex h-7 items-center text-base">{t("appName")}</SheetTitle>
@@ -285,10 +288,10 @@ export function AppShell() {
             </SheetContent>
           </Sheet>
           <span className="text-sm font-semibold">{t("appName")}</span>
-          <span className="w-8" />
+          <span className="w-8" aria-hidden="true" />
         </header>
 
-        <main className="mx-auto w-full max-w-[1280px] flex-1 px-5 py-8 sm:px-8 lg:py-20">
+        <main className="mx-auto w-full max-w-[1280px] flex-1 px-4 py-6 sm:px-8 sm:py-8 lg:py-20">
           <Outlet />
         </main>
         <SiteFooter />

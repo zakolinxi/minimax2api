@@ -12,7 +12,12 @@
  *          --user-data-dir=<temp dir> about:blank
  *
  * Usage:
- *   node tools/render.mjs [base] [cdp] [password] [screenshot-dir]
+ *   node tools/render.mjs [base] [cdp] [password] [screenshot-dir] [src-dir] [viewport]
+ *
+ * `viewport` is `WIDTHxHEIGHT` (default 1440x900). Pass `390x844` to check the
+ * phone layout: a page that renders at desktop width can still be unusable
+ * there — tables squeezed to a few pixels, a header that pushes the content off
+ * screen — and nothing in the desktop run would notice.
  */
 
 import fs from "node:fs";
@@ -22,6 +27,15 @@ const BASE = (process.argv[2] || "http://127.0.0.1:8080").replace(/\/$/, "");
 const CDP = (process.argv[3] || "http://127.0.0.1:9222").replace(/\/$/, "");
 const PASSWORD = process.argv[4] || "admin12345";
 const SHOT_DIR = process.argv[5] || "";
+const VIEWPORT = parseViewport(process.argv[7] || "1440x900");
+
+// parseViewport falls back to the desktop size rather than failing: a typo in a
+// throwaway argument should not abort a check that is otherwise fine.
+function parseViewport(value) {
+  const match = /^(\d+)x(\d+)$/.exec(String(value).trim());
+  if (!match) return { width: 1440, height: 900 };
+  return { width: Number(match[1]), height: Number(match[2]) };
+}
 
 // A token-shaped string for the add-account flow check.
 //
@@ -392,6 +406,7 @@ async function main() {
   console.log("MiniMax2API real-browser render check");
   console.log(`base = ${BASE}`);
   console.log(`cdp  = ${CDP}`);
+  console.log(`viewport = ${VIEWPORT.width}x${VIEWPORT.height}`);
   if (SHOT_DIR) console.log(`shots = ${SHOT_DIR}`);
   console.log();
 
@@ -431,10 +446,10 @@ async function main() {
   await session.send("Network.enable");
   await session.send("Network.setCacheDisabled", { cacheDisabled: true });
   await session.send("Emulation.setDeviceMetricsOverride", {
-    width: 1440,
-    height: 900,
+    width: VIEWPORT.width,
+    height: VIEWPORT.height,
     deviceScaleFactor: 1,
-    mobile: false,
+    mobile: VIEWPORT.width < 640,
   });
 
   console.log("public surface");

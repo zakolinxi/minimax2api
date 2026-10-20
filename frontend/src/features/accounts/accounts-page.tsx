@@ -714,7 +714,7 @@ export function AccountsPage() {
         }
       />
 
-      <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+      <section className="grid grid-cols-2 gap-2 xl:grid-cols-5">
         <AccountMetricPanel
           tone="text-quota-product-1"
           icon={<SquareTerminal />}
@@ -1421,8 +1421,8 @@ function AccountMetricPanel({
   detail: string;
 }) {
   return (
-    <article className="flex min-h-24 items-center gap-4 rounded-lg bg-card p-4" aria-busy={loading}>
-      <span className={cn("flex size-9 shrink-0 items-center justify-center rounded-md bg-secondary/70 [&_svg]:size-4", tone)}>
+    <article className="flex min-h-24 items-center gap-3 rounded-lg bg-card p-3 sm:gap-4 sm:p-4" aria-busy={loading}>
+      <span className={cn("flex size-8 shrink-0 items-center justify-center rounded-md bg-secondary/70 sm:size-9 [&_svg]:size-4", tone)}>
         {icon}
       </span>
       <div className="min-w-0">
@@ -1481,7 +1481,7 @@ function AccountsTable({
   }, [items, sort]);
 
   return (
-    <Table>
+    <Table className="md:min-w-[1000px]">
       <TableHeader>
         <TableRow>
           <TableHead className="px-2">
@@ -1494,15 +1494,15 @@ function AccountsTable({
           <SortableTableHead field="name">
             {t("accounts.account")}
           </SortableTableHead>
-          <TableHead className="whitespace-nowrap">{t("accounts.type")}</TableHead>
+          <TableHead className="hidden whitespace-nowrap md:table-cell">{t("accounts.type")}</TableHead>
           <SortableTableHead field="status" align="center" className="whitespace-nowrap">
             {t("accounts.status")}
           </SortableTableHead>
-          <TableHead className="whitespace-nowrap">{t("accounts.signin")}</TableHead>
+          <TableHead className="hidden whitespace-nowrap md:table-cell">{t("accounts.signin")}</TableHead>
           <TableHead className="whitespace-nowrap">{t("accounts.credit")}</TableHead>
-          <TableHead className="whitespace-nowrap">{t("accounts.quota")}</TableHead>
-          <TableHead className="whitespace-nowrap">{t("accounts.priority")}</TableHead>
-          <SortableTableHead field="createdAt" initialOrder="desc" className="whitespace-nowrap">
+          <TableHead className="hidden whitespace-nowrap md:table-cell">{t("accounts.quota")}</TableHead>
+          <TableHead className="hidden whitespace-nowrap md:table-cell">{t("accounts.priority")}</TableHead>
+          <SortableTableHead field="createdAt" initialOrder="desc" className="hidden whitespace-nowrap md:table-cell">
             {t("accounts.createdAt")}
           </SortableTableHead>
           <TableActionHead />
@@ -1521,25 +1521,25 @@ function AccountsTable({
             <TableCell>
               <AccountNameCell account={account} />
             </TableCell>
-            <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+            <TableCell className="hidden whitespace-nowrap text-xs text-muted-foreground md:table-cell">
               {account.kind === "token" ? "Token" : t("accounts.providerMiniMax")}
             </TableCell>
             <TableCell>
               <AccountStatusCell account={account} />
             </TableCell>
-            <TableCell>
+            <TableCell className="hidden md:table-cell">
               <AccountSigninCell account={account} />
             </TableCell>
             <TableCell>
               <AccountCreditCell account={account} enforced={skipZeroCredit} />
             </TableCell>
-            <TableCell>
+            <TableCell className="hidden md:table-cell">
               <AccountQuotaCell quota={account.quota} />
             </TableCell>
-            <TableCell>
+            <TableCell className="hidden md:table-cell">
               <AccountRoutingCell account={account} />
             </TableCell>
-            <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+            <TableCell className="hidden whitespace-nowrap text-xs text-muted-foreground md:table-cell">
               {formatDateTime(account.createdAt, i18n.language)}
             </TableCell>
             <TableActionCell>
