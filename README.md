@@ -187,7 +187,7 @@ node tools/browser-login-bridge.mjs --port 8766
 ### 调用
 
 ```bash
-# 先在管理台「客户端密钥」建一个 key
+# 先在管理台「客户端密钥」建一个 key（RPM 与并发都填 0 表示不限制，并发正数上限 256）
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Authorization: Bearer sk-mm-xxxxxxxx" \
   -H "Content-Type: application/json" \

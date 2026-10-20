@@ -41,11 +41,10 @@ func (l *limiter) acquire(key *store.ClientKey) error {
 		l.windows[key.ID] = append(recent, time.Now())
 	}
 
-	limit := key.MaxConcurrent
-	if limit <= 0 {
-		limit = 4
-	}
-	if l.inflight[key.ID] >= limit {
+	// A non-positive MaxConcurrent means unlimited, the same way RPMLimit reads
+	// zero. It used to fall back to 4, which made "unset" mean "four" and left
+	// no way to ask for no limit at all.
+	if limit := key.MaxConcurrent; limit > 0 && l.inflight[key.ID] >= limit {
 		return fmt.Errorf("concurrency limit exceeded (%d simultaneous requests)", limit)
 	}
 	l.inflight[key.ID]++

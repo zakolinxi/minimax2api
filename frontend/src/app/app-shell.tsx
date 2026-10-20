@@ -10,6 +10,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input, Label } from "@/components/ui/input";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { useServerVersion } from "@/shared/api/health";
 import { useAuth } from "@/shared/auth/auth-context";
 import { SiteFooter } from "@/shared/components/site-footer";
 import { cn } from "@/shared/lib/cn";
@@ -58,6 +59,7 @@ export function AppShell() {
   const { t, i18n } = useTranslation();
   const { admin, logout, changePassword } = useAuth();
   const { setTheme } = useTheme();
+  const version = useServerVersion();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [passwordBusy, setPasswordBusy] = useState(false);
@@ -251,7 +253,9 @@ export function AppShell() {
         <div className="flex h-7 shrink-0 items-center justify-between px-2.5">
           <Link to="/dashboard" className="flex h-7 items-baseline gap-2 text-base font-semibold text-foreground">
             <span>{t("appName")}</span>
-            <span className="font-mono text-[10px] font-normal text-muted-foreground">v0.1.0</span>
+            {version ? (
+              <span className="font-mono text-[10px] font-normal text-muted-foreground">v{version}</span>
+            ) : null}
           </Link>
           <span className="rounded-full bg-secondary/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">Agent</span>
         </div>

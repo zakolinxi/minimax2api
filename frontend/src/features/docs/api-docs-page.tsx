@@ -2,6 +2,7 @@ import { useTranslation } from "react-i18next";
 import { Navigate, useParams } from "react-router-dom";
 
 import { Badge } from "@/components/ui/badge";
+import { useServerVersion } from "@/shared/api/health";
 import { PageHeader } from "@/shared/components/page-header";
 import { cn } from "@/shared/lib/cn";
 
@@ -219,7 +220,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \\
     request: `curl http://127.0.0.1:8080/health`,
     response: `{
   "status": "ok",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "pool": { "total": 12, "available": 10, "cooldown": 1, "invalid": 1 }
 }`,
     parameters: [],
@@ -228,6 +229,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \\
 
 export function ApiDocsPage() {
   const { t } = useTranslation();
+  const version = useServerVersion();
   const params = useParams<{ category: string; endpoint: string }>();
   const doc = ENDPOINTS.find((item) => item.category === params.category && item.endpoint === params.endpoint);
 
@@ -241,6 +243,11 @@ export function ApiDocsPage() {
     return <Navigate to={`/docs/${first.category}/${first.endpoint}`} replace />;
   }
   const base = typeof window === "undefined" ? "http://127.0.0.1:8080" : window.location.origin;
+  // The health sample is the one response carrying a release number, so it is
+  // filled from the running binary instead of a literal that goes stale on the
+  // next bump.
+  const response =
+    doc.endpoint === "health" && version ? doc.response.replace(/"version":\s*"[^"]*"/, `"version": "${version}"`) : doc.response;
 
   return (
     <div className="space-y-5">
@@ -312,7 +319,7 @@ export function ApiDocsPage() {
           </div>
           <div className="space-y-1">
             <h3 className="text-xs font-medium">{t("docs.responseExample")}</h3>
-            <pre className="max-h-72 overflow-auto rounded-md bg-secondary/60 p-3 font-mono text-[11px] leading-5">{doc.response}</pre>
+            <pre className="max-h-72 overflow-auto rounded-md bg-secondary/60 p-3 font-mono text-[11px] leading-5">{response}</pre>
           </div>
         </div>
       </section>

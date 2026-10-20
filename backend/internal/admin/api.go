@@ -1554,7 +1554,7 @@ func (a *API) createClientKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "密钥名称不能为空")
 		return
 	}
-	key, err := a.store.CreateClientKey(strings.TrimSpace(payload.Name), maxInt(0, payload.RPMLimit), clampInt(payload.MaxConcurrent, 1, 256))
+	key, err := a.store.CreateClientKey(strings.TrimSpace(payload.Name), maxInt(0, payload.RPMLimit), concurrencyLimit(payload.MaxConcurrent))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1588,7 +1588,7 @@ func (a *API) updateClientKey(w http.ResponseWriter, r *http.Request) {
 			key.RPMLimit = maxInt(0, *payload.RPMLimit)
 		}
 		if payload.MaxConcurrent != nil {
-			key.MaxConcurrent = clampInt(*payload.MaxConcurrent, 1, 256)
+			key.MaxConcurrent = concurrencyLimit(*payload.MaxConcurrent)
 		}
 	})
 	if err != nil {
@@ -1833,6 +1833,20 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": message})
+}
+
+// concurrencyLimit normalises a client key's concurrency setting.
+//
+// Zero (and anything below it) means unlimited, mirroring how RPMLimit treats
+// zero, and that is the value the limiter checks for. Positive values keep the
+// 1..256 window so a typo cannot ask for a million upstream sessions; a key that
+// genuinely needs more than 256 at once is a case for the server-wide
+// maxConcurrentRequests setting rather than a single key's ceiling.
+func concurrencyLimit(value int) int {
+	if value <= 0 {
+		return 0
+	}
+	return clampInt(value, 1, 256)
 }
 
 func clampInt(value, low, high int) int {

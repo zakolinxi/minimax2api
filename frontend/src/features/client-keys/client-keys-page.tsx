@@ -154,7 +154,9 @@ export function ClientKeysPage() {
                   <TableCell className="text-center text-xs tabular-nums">
                     {item.rpmLimit > 0 ? item.rpmLimit : t("clientKeys.unlimited")}
                   </TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">{item.maxConcurrent}</TableCell>
+                  <TableCell className="text-center text-xs tabular-nums">
+                    {item.maxConcurrent > 0 ? item.maxConcurrent : t("clientKeys.unlimited")}
+                  </TableCell>
                   <TableCell className="text-center text-xs tabular-nums">{formatNumber(item.totalRequests, i18n.language)}</TableCell>
                   <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
                     {formatDateTime(item.createdAt, i18n.language)}
@@ -236,7 +238,7 @@ export function ClientKeysPage() {
                   <Input
                     id="key-concurrent"
                     type="number"
-                    min={1}
+                    min={0}
                     max={256}
                     value={maxConcurrent}
                     onChange={(event) => setMaxConcurrent(Number(event.target.value))}
