@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Copy, KeyRound, Plus, Power, PowerOff, Trash2 } from "lucide-react";
+import { Check, Copy, KeyRound, Pencil, Plus, Power, PowerOff, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -42,6 +42,13 @@ export function ClientKeysPage() {
   const [rpmLimit, setRpmLimit] = useState(60);
   const [maxConcurrent, setMaxConcurrent] = useState(4);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
+  // Editing exists because the limits are not fixed at creation: a key created
+  // with a ceiling of 4 is exactly the key someone later wants to lift, and
+  // reissuing it would break every client already using it.
+  const [editTarget, setEditTarget] = useState<ClientKeyDTO | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editRpm, setEditRpm] = useState(0);
+  const [editConcurrent, setEditConcurrent] = useState(0);
   const [deleteTarget, setDeleteTarget] = useState<ClientKeyDTO | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -80,6 +87,31 @@ export function ClientKeysPage() {
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
+
+  function openEdit(item: ClientKeyDTO): void {
+    setEditTarget(item);
+    setEditName(item.name);
+    setEditRpm(item.rpmLimit);
+    setEditConcurrent(item.maxConcurrent);
+  }
+
+  function saveEdit(): void {
+    if (!editTarget) return;
+    updateMutation.mutate(
+      {
+        id: editTarget.id,
+        // An empty name is ignored by the server, which is what lets the field
+        // stay optional here; the two limits are sent as they read.
+        payload: { name: editName.trim(), rpmLimit: editRpm, maxConcurrent: editConcurrent },
+      },
+      {
+        onSuccess: () => {
+          setEditTarget(null);
+          toast.success(t("clientKeys.updated"));
+        },
+      },
+    );
+  }
 
   async function copy(value: string): Promise<void> {
     try {
@@ -167,6 +199,15 @@ export function ClientKeysPage() {
                   </TableCell>
                   <TableActionCell>
                     <div className="flex items-center gap-1">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-7 text-muted-foreground"
+                        aria-label={t("common.edit")}
+                        onClick={() => openEdit(item)}
+                      >
+                        <Pencil />
+                      </Button>
                       <Button
                         variant="ghost"
                         size="icon"
@@ -261,6 +302,54 @@ export function ClientKeysPage() {
                 {t("common.create")}
               </Button>
             )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editTarget !== null} onOpenChange={(open) => (!open ? setEditTarget(null) : undefined)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("clientKeys.editTitle")}</DialogTitle>
+            <DialogDescription>{t("clientKeys.editDescription")}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="edit-key-name">{t("clientKeys.keyName")}</Label>
+              <Input id="edit-key-name" value={editName} onChange={(event) => setEditName(event.target.value)} />
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="edit-key-rpm">{t("clientKeys.rpm")}</Label>
+                <Input
+                  id="edit-key-rpm"
+                  type="number"
+                  min={0}
+                  value={editRpm}
+                  onChange={(event) => setEditRpm(Math.max(0, Math.trunc(Number(event.target.value) || 0)))}
+                />
+                <p className="text-[11px] text-muted-foreground">{t("clientKeys.rpmHelp")}</p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="edit-key-concurrent">{t("clientKeys.maxConcurrent")}</Label>
+                <Input
+                  id="edit-key-concurrent"
+                  type="number"
+                  min={0}
+                  max={256}
+                  value={editConcurrent}
+                  onChange={(event) => setEditConcurrent(Math.max(0, Math.trunc(Number(event.target.value) || 0)))}
+                />
+                <p className="text-[11px] text-muted-foreground">{t("clientKeys.concurrentHelp")}</p>
+              </div>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="secondary" size="sm" onClick={() => setEditTarget(null)}>
+              {t("common.cancel")}
+            </Button>
+            <Button size="sm" disabled={updateMutation.isPending} onClick={() => saveEdit()}>
+              {t("common.save")}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
