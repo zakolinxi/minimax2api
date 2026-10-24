@@ -592,7 +592,9 @@ func (s *Service) refreshCredit(ctx context.Context, account *store.Account) int
 	s.record(account.ID, func(target *store.Account) {
 		target.Credit = &store.Credit{
 			Total: info.Total, Free: info.Free, Purchased: info.Purchased,
-			PlanName: info.PlanName, PlanType: info.PlanType, SyncedAt: time.Now(),
+			PlanName: info.PlanName, PlanType: info.PlanType,
+			TokenPlanTier: info.TokenPlanTier, TokenPlanExpiresAt: info.TokenPlanExpiresAt,
+			SyncedAt: time.Now(),
 		}
 	})
 	return info.Total
@@ -614,7 +616,9 @@ func (s *Service) RefreshCredit(ctx context.Context, id string) (*store.Credit, 
 	}
 	credit := &store.Credit{
 		Total: info.Total, Free: info.Free, Purchased: info.Purchased,
-		PlanName: info.PlanName, PlanType: info.PlanType, SyncedAt: time.Now(),
+		PlanName: info.PlanName, PlanType: info.PlanType,
+		TokenPlanTier: info.TokenPlanTier, TokenPlanExpiresAt: info.TokenPlanExpiresAt,
+		SyncedAt: time.Now(),
 	}
 	s.record(id, func(target *store.Account) { target.Credit = credit })
 	return credit, nil

@@ -61,6 +61,13 @@ export type AccountCredit = {
   purchased: number;
   planName: string;
   planType: number;
+  /**
+   * Token Plan subscription read from the same membership response. The tier
+   * is the label the web client shows; the expiry is the date it ends, and an
+   * elapsed date means the account no longer counts as subscribed.
+   */
+  tokenPlanTier: string;
+  tokenPlanExpiresAt: string;
   syncedAt: string;
 };
 
@@ -101,6 +108,12 @@ export type AccountDTO = {
   signinError: string;
   signinPanel: AccountSigninPanel | null;
   credit: AccountCredit | null;
+  /**
+   * Derived by the backend from the last membership sync: a known paid plan.
+   * It is the same rule the pool uses for plan-only models such as H3, so the
+   * console never claims an account is eligible when routing disagrees.
+   */
+  subscribed: boolean;
 };
 
 export type AccountSummary = {
@@ -139,6 +152,8 @@ export type AccountQuery = {
   status?: string;
   kind?: string;
   group?: string;
+  /** "true" / "false"; omitted means no filter. */
+  subscribed?: string;
   sortBy?: string;
   sortOrder?: "asc" | "desc";
 };
@@ -170,6 +185,7 @@ export function listAccounts(query: AccountQuery): Promise<AccountListResult> {
   if (query.status) params.set("status", query.status);
   if (query.kind) params.set("kind", query.kind);
   if (query.group) params.set("group", query.group);
+  if (query.subscribed) params.set("subscribed", query.subscribed);
   if (query.sortBy) params.set("sortBy", query.sortBy);
   if (query.sortOrder) params.set("sortOrder", query.sortOrder);
   return apiRequest<AccountListResult>(`/admin/api/accounts?${params.toString()}`);

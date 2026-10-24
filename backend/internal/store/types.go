@@ -1,6 +1,7 @@
 package store
 
 import (
+	"strings"
 	"time"
 
 	"minimax2api/internal/config"
@@ -86,17 +87,47 @@ type SigninPanel struct {
 // op_credit_summary.total_remaining_amount; the flat fields beside it belong to
 // the pre-migration credit system and read zero on every migrated account.
 type Credit struct {
-	Total     int       `json:"total"`
-	Free      int       `json:"free"`
-	Purchased int       `json:"purchased"`
-	PlanName  string    `json:"planName"`
-	PlanType  int       `json:"planType"`
-	SyncedAt  time.Time `json:"syncedAt"`
+	Total     int    `json:"total"`
+	Free      int    `json:"free"`
+	Purchased int    `json:"purchased"`
+	PlanName  string `json:"planName"`
+	PlanType  int    `json:"planType"`
+	// TokenPlanTier and TokenPlanExpiresAt are the subscription the plan-only
+	// models require. Zero expiry means the upstream sent no date, not "never
+	// expires" — an unknown date is treated as usable, an elapsed one is not.
+	TokenPlanTier      string    `json:"tokenPlanTier"`
+	TokenPlanExpiresAt time.Time `json:"tokenPlanExpiresAt"`
+	SyncedAt           time.Time `json:"syncedAt"`
 }
 
 // Exhausted reports whether the balance is known to be spent.
 func (c *Credit) Exhausted() bool {
 	return c != nil && c.Total <= 0
+}
+
+// freePlanName is the membership label the upstream reports for an account
+// without a paid plan. Everything else in plan_name counts as subscribed: the
+// tiers above Free are the ones the video-quota models require.
+const freePlanName = "Free"
+
+// Subscribed reports whether the account currently holds a paid plan.
+//
+// The Token Plan reading wins when the upstream sent one: it is the
+// subscription the plan-only models require, and its expiry is authoritative —
+// a cached tier label must not keep an expired plan in rotation. An account
+// with no reading is deliberately not treated as subscribed: "unknown" is not
+// evidence of a plan. Readings that predate the Token Plan fields fall back to
+// the membership name, which is what the console showed before.
+func (a *Account) Subscribed() bool {
+	if a == nil || a.Credit == nil {
+		return false
+	}
+	tier := strings.TrimSpace(a.Credit.TokenPlanTier)
+	if tier != "" && !strings.EqualFold(tier, freePlanName) {
+		return a.Credit.TokenPlanExpiresAt.IsZero() || a.Credit.TokenPlanExpiresAt.After(time.Now())
+	}
+	plan := strings.TrimSpace(a.Credit.PlanName)
+	return plan != "" && !strings.EqualFold(plan, freePlanName)
 }
 
 type Account struct {
@@ -195,8 +226,12 @@ type AccountView struct {
 	SigninError  string       `json:"signinError"`
 	SigninPanel  *SigninPanel `json:"signinPanel"`
 	Credit       *Credit      `json:"credit"`
-	TokenMasked  string       `json:"tokenMasked"`
-	Inflight     int          `json:"inflight"`
+	// Subscribed is projected rather than stored: it is derived from the last
+	// membership sync, and a stored copy would be one more thing that can
+	// disagree with the reading it came from.
+	Subscribed  bool   `json:"subscribed"`
+	TokenMasked string `json:"tokenMasked"`
+	Inflight    int    `json:"inflight"`
 }
 
 // NewAccountView projects an account for API responses.
@@ -217,6 +252,7 @@ func NewAccountView(account *Account, inflight int) AccountView {
 		SigninStreak: account.SigninStreak, SigninPoints: account.SigninPoints,
 		SigninTotal: account.SigninTotal, SigninError: account.SigninError,
 		SigninPanel: account.SigninPanel, Credit: account.Credit,
+		Subscribed: account.Subscribed(),
 	}
 }
 
@@ -319,11 +355,16 @@ type ModelConfig struct {
 	// control and the gateway sends no variant for it.
 	ThinkingMode string `json:"thinkingMode,omitempty"`
 	Type         string `json:"type"`
-	Enabled      bool   `json:"enabled"`
-	Builtin      bool   `json:"builtin"`
-	Description  string `json:"description"`
-	Requests     int64  `json:"requests"`
-	Tokens       int64  `json:"tokens"`
+	// SubscriptionOnly marks a model the upstream only serves to accounts with
+	// a paid plan — the H3 pair since October 2026. Routing filters the pool to
+	// subscribed accounts before trying one, because a free account is charged
+	// for the turn and then refused.
+	SubscriptionOnly bool   `json:"subscriptionOnly,omitempty"`
+	Enabled          bool   `json:"enabled"`
+	Builtin          bool   `json:"builtin"`
+	Description      string `json:"description"`
+	Requests         int64  `json:"requests"`
+	Tokens           int64  `json:"tokens"`
 }
 
 type State struct {
@@ -395,14 +436,15 @@ func BuiltinModels() []*ModelConfig {
 		},
 		{
 			ID: "minimax-h3", Name: "MiniMax H3.0", Upstream: "video", UpstreamModel: "MiniMax-H3",
-			Type: ModelTypeVideo, Enabled: true, Builtin: true,
+			Type: ModelTypeVideo, Enabled: true, Builtin: true, SubscriptionOnly: true,
 			Ratios: videoRatios(), Resolutions: []string{"768P", "2K"}, Durations: videoDurations(),
-			Description: "视频生成，质量优先；消耗账号积分，不占用 Token Plan；支持多模态参考",
+			Description: "视频生成，质量优先；需订阅账号（Token Plan）；支持多模态参考",
 		},
 		{
 			ID: "minimax-h3-max", Name: "MiniMax H3 Max", Upstream: "video", UpstreamModel: "MiniMax-H3-Max",
 			Type: ModelTypeVideo, Enabled: true, Builtin: true,
-			Ratios: videoRatios(), Resolutions: []string{"480P", "768P"}, Durations: videoDurations(),
+			SubscriptionOnly: true,
+			Ratios:           videoRatios(), Resolutions: []string{"480P", "768P"}, Durations: videoDurations(),
 			// Two, because this variant animates a first and a last frame
 			// rather than taking a reference set. A third picture has nowhere
 			// to go, and the plugin's answer to a parameter it cannot use is to
@@ -412,7 +454,7 @@ func BuiltinModels() []*ModelConfig {
 			// are structured fields now, and a fact stated twice is a fact that
 			// will disagree with itself eventually — the console renders the
 			// ranges from the fields, so the prose no longer repeats them.
-			Description: "视频生成，约 20 秒完成；仅支持文生视频与首/尾帧",
+			Description: "视频生成，约 20 秒完成；需订阅账号（Token Plan）；仅支持文生视频与首/尾帧",
 		},
 		{
 			// Hailuo carries no limits on purpose: its parameter panel has not
@@ -440,6 +482,14 @@ func videoRatios() []string {
 // expressible without a second representation.
 func videoDurations() []int {
 	return []int{5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+}
+
+// legacyModelDescriptions are built-in descriptions this release replaced.
+// They are only rewritten while the stored text still matches exactly, so an
+// operator's own wording is never overwritten.
+var legacyModelDescriptions = map[string]string{
+	"minimax-h3":     "视频生成，质量优先；消耗账号积分，不占用 Token Plan；支持多模态参考",
+	"minimax-h3-max": "视频生成，约 20 秒完成；仅支持文生视频与首/尾帧",
 }
 
 // retiredBuiltinModels are catalogue ids the upstream no longer offers.
@@ -566,6 +616,22 @@ func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
 		}
 		if model.ThinkingMode == "" && builtin.ThinkingMode != "" {
 			model.ThinkingMode = builtin.ThinkingMode
+			changed = true
+		}
+		// A plan requirement is a fact about the upstream rather than policy
+		// the console can edit, so it is adopted unconditionally. An install
+		// that froze the catalogue before H3 became plan-only would otherwise
+		// keep routing free accounts at it — and pay for the refusal.
+		if builtin.SubscriptionOnly && !model.SubscriptionOnly {
+			model.SubscriptionOnly = true
+			changed = true
+		}
+		// The billing note on the H3 entries is now wrong on every install that
+		// froze the catalogue before the change. Rewrite it only while the
+		// stored text is still the built-in's old wording, so an operator's own
+		// edit is never overwritten.
+		if legacy, ok := legacyModelDescriptions[model.ID]; ok && model.Description == legacy {
+			model.Description = builtin.Description
 			changed = true
 		}
 	}

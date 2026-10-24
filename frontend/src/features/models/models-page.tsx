@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tooltip } from "@/components/ui/tooltip";
 import { listModels, updateModel, type ModelDTO } from "@/features/models/models-api";
 import { errorMessage } from "@/shared/api/client";
 import { DataTableShell } from "@/shared/components/data-table-shell";
@@ -171,7 +172,19 @@ export function ModelsPage() {
                     </span>
                   </TableCell>
                   <TableCell className="text-xs">
-                    <p>{model.name}</p>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <p>{model.name}</p>
+                      {model.subscriptionOnly ? (
+                        <Tooltip label={t("models.subscriptionOnlyHelp")}>
+                          <Badge
+                            variant="outline"
+                            className="whitespace-nowrap border-emerald-500/40 text-emerald-700 dark:text-emerald-300"
+                          >
+                            {t("models.subscriptionOnly")}
+                          </Badge>
+                        </Tooltip>
+                      ) : null}
+                    </div>
                     <p className="mt-0.5 text-[10px] text-muted-foreground">{model.description}</p>
                     <ModelRanges model={model} />
                   </TableCell>

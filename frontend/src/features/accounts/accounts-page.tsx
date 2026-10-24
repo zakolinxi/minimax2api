@@ -83,7 +83,7 @@ import {
   type AccountRegionInput,
   type AccountSummary,
 } from "@/features/accounts/accounts-api";
-import { AccountNameCell, AccountRoutingCell, AccountStatusCell } from "@/features/accounts/account-name-cell";
+import { AccountNameCell, AccountPlanCell, AccountRoutingCell, AccountStatusCell } from "@/features/accounts/account-name-cell";
 import { AccountQuotaCell } from "@/features/accounts/account-quota";
 import { AccountCreditCell, AccountSigninCell } from "@/features/accounts/account-signin";
 import { getSettings } from "@/features/settings/settings-api";
@@ -176,6 +176,7 @@ export function AccountsPage() {
   const [statusFilter, setStatusFilter] = useState("");
   const [kindFilter, setKindFilter] = useState("");
   const [groupFilter, setGroupFilter] = useState("");
+  const [subscriptionFilter, setSubscriptionFilter] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
   const [editor, setEditor] = useState<EditorState>(EMPTY_EDITOR);
@@ -204,7 +205,7 @@ export function AccountsPage() {
   const browserMountedRef = useRef(true);
 
   const accountsQuery = useQuery({
-    queryKey: ["accounts", page, pageSize, search, statusFilter, kindFilter, groupFilter],
+    queryKey: ["accounts", page, pageSize, search, statusFilter, kindFilter, groupFilter, subscriptionFilter],
     queryFn: () =>
       listAccounts({
         page,
@@ -213,6 +214,7 @@ export function AccountsPage() {
         status: statusFilter || undefined,
         kind: kindFilter || undefined,
         group: groupFilter || undefined,
+        subscribed: subscriptionFilter || undefined,
       }),
     placeholderData: (previous) => previous,
   });
@@ -475,6 +477,15 @@ export function AccountsPage() {
       ...(groupsQuery.data?.groups ?? []).map((group) => ({ value: group, label: group })),
     ],
     [groupsQuery.data, t],
+  );
+
+  const subscriptionOptions = useMemo(
+    () => [
+      { value: "", label: t("accounts.allSubscriptions") },
+      { value: "true", label: t("accounts.subscribed") },
+      { value: "false", label: t("accounts.unsubscribed") },
+    ],
+    [t],
   );
 
   function toggleAccount(id: string, checked: boolean): void {
@@ -812,6 +823,19 @@ export function AccountsPage() {
                   setPage(1);
                 }}
                 options={groupOptions}
+              />
+              {/* Plan status is a routing input for the H3 video models, not a
+                  cosmetic filter: an account without a paid plan is never
+                  picked for them. */}
+              <Select
+                ariaLabel={t("accounts.subscriptionFilter")}
+                className="min-w-28"
+                value={subscriptionFilter}
+                onChange={(value) => {
+                  setSubscriptionFilter(value);
+                  setPage(1);
+                }}
+                options={subscriptionOptions}
               />
             </div>
 
@@ -1498,6 +1522,7 @@ function AccountsTable({
           <SortableTableHead field="status" align="center" className="whitespace-nowrap">
             {t("accounts.status")}
           </SortableTableHead>
+          <TableHead className="hidden whitespace-nowrap md:table-cell">{t("accounts.subscription")}</TableHead>
           <TableHead className="hidden whitespace-nowrap md:table-cell">{t("accounts.signin")}</TableHead>
           <TableHead className="whitespace-nowrap">{t("accounts.credit")}</TableHead>
           <TableHead className="hidden whitespace-nowrap md:table-cell">{t("accounts.quota")}</TableHead>
@@ -1526,6 +1551,9 @@ function AccountsTable({
             </TableCell>
             <TableCell>
               <AccountStatusCell account={account} />
+            </TableCell>
+            <TableCell className="hidden whitespace-nowrap md:table-cell">
+              <AccountPlanCell account={account} />
             </TableCell>
             <TableCell className="hidden md:table-cell">
               <AccountSigninCell account={account} />

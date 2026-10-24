@@ -29,6 +29,41 @@ func unsignedToken(t *testing.T, claims map[string]any) string {
 	return encode(map[string]any{"alg": "HS256", "typ": "JWT"}) + "." + encode(claims) + ".signature"
 }
 
+// A record is searched by everything an operator can see in it. The payload
+// fields matter most: they are the only way to find a request after the fact,
+// since nobody remembers the generated id of the call they want to inspect.
+func TestAuditSearchCoversPayloadAndMetadata(t *testing.T) {
+	audit := &store.Audit{
+		ID: "req_4f2a", Model: "minimax-m3", KeyName: "desk", AccountName: "matrix",
+		Status: 502, IP: "10.1.2.3", UserAgent: "curl/8.5.0",
+		Error:        "upstream timed out",
+		RequestBody:  `{"messages":[{"content":"how do I reindex"}]}`,
+		ResponseBody: `{"error":"boom"}`,
+	}
+	cases := []struct {
+		needle string
+		want   bool
+	}{
+		{"req_4f2a", true},
+		{"minimax-m3", true},
+		{"m3.1 flash", true}, // model display name, supplied separately
+		{"desk", true},
+		{"matrix", true},
+		{"10.1.2.3", true},
+		{"curl", true},
+		{"502", true},
+		{"timed out", true},
+		{"reindex", true},
+		{"boom", true},
+		{"missing", false},
+	}
+	for _, tc := range cases {
+		if got := auditMatchesSearch(audit, tc.needle, "MiniMax M3.1 Flash"); got != tc.want {
+			t.Errorf("auditMatchesSearch(%q) = %v, want %v", tc.needle, got, tc.want)
+		}
+	}
+}
+
 func TestBuildAccountInfersRegionFromPhone(t *testing.T) {
 	cases := []struct {
 		name   string

@@ -20,6 +20,9 @@ var (
 	ErrNoAccount = errors.New("no account available")
 	// ErrNoCapacity means every account is saturated or cooling down.
 	ErrNoCapacity = errors.New("all accounts are busy")
+	// ErrNoEligible means the pool has accounts but none matches the filter a
+	// request brought. Waiting cannot change that, so it is returned at once.
+	ErrNoEligible = errors.New("no account matches the request requirements")
 )
 
 type stickyEntry struct {
@@ -78,17 +81,35 @@ func (p *Pool) Snapshot() map[string]int {
 	return out
 }
 
+// AcquireOptions narrows which account one request may ride on.
+type AcquireOptions struct {
+	SessionKey string
+	// Eligible, when set, must accept an account before it can be picked.
+	Eligible func(*store.Account) bool
+	// IgnoreCreditGuard skips the zero-balance hold. It exists for models the
+	// upstream bills against a plan quota instead of the credit balance, where
+	// a zero balance says nothing about whether the call is affordable.
+	IgnoreCreditGuard bool
+}
+
 // Acquire borrows an account, waiting up to the configured capacity timeout.
 func (p *Pool) Acquire(ctx context.Context, sessionKey string) (*Lease, error) {
+	return p.AcquireWith(ctx, AcquireOptions{SessionKey: sessionKey})
+}
+
+// AcquireWith is Acquire with a request-specific filter. ErrNoEligible is
+// returned immediately rather than after the capacity wait: a later release
+// cannot make an account that fails the filter match it.
+func (p *Pool) AcquireWith(ctx context.Context, opts AcquireOptions) (*Lease, error) {
 	settings := p.settings()
 	deadline := time.Now().Add(settings.CapacityWait())
 
 	for {
-		account, wait := p.pick(sessionKey)
+		account, wait := p.pick(opts)
 		if account != nil {
 			return &Lease{Account: account, pool: p}, nil
 		}
-		if time.Now().After(deadline) {
+		if errors.Is(wait, ErrNoEligible) || time.Now().After(deadline) {
 			return nil, wait
 		}
 		select {
@@ -100,7 +121,7 @@ func (p *Pool) Acquire(ctx context.Context, sessionKey string) (*Lease, error) {
 }
 
 // pick selects a routable account and reserves an in-flight slot.
-func (p *Pool) pick(sessionKey string) (*store.Account, error) {
+func (p *Pool) pick(opts AcquireOptions) (*store.Account, error) {
 	// Read the store and settings before taking p.mu. Keeping every cross
 	// component call outside the critical section means p.mu can never take
 	// part in a lock-order cycle with store.mu.
@@ -109,6 +130,20 @@ func (p *Pool) pick(sessionKey string) (*store.Account, error) {
 		return nil, ErrNoAccount
 	}
 	settings := p.settings()
+	sessionKey := opts.SessionKey
+	eligible := opts.Eligible
+	if eligible != nil {
+		matched := false
+		for _, account := range accounts {
+			if eligible(account) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return nil, ErrNoEligible
+		}
+	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -122,7 +157,10 @@ func (p *Pool) pick(sessionKey string) (*store.Account, error) {
 				delete(p.sticky, sessionKey)
 			} else {
 				for _, account := range accounts {
-					if account.ID == entry.accountID && routable(account, p.inflight[account.ID], now, settings) {
+					if account.ID != entry.accountID || (eligible != nil && !eligible(account)) {
+						continue
+					}
+					if routable(account, p.inflight[account.ID], now, settings, opts.IgnoreCreditGuard) {
 						p.inflight[account.ID]++
 						entry.expires = now.Add(settings.StickyTTL())
 						p.sticky[sessionKey] = entry
@@ -135,7 +173,10 @@ func (p *Pool) pick(sessionKey string) (*store.Account, error) {
 
 	candidates := make([]*store.Account, 0, len(accounts))
 	for _, account := range accounts {
-		if routable(account, p.inflight[account.ID], now, settings) {
+		if eligible != nil && !eligible(account) {
+			continue
+		}
+		if routable(account, p.inflight[account.ID], now, settings, opts.IgnoreCreditGuard) {
 			candidates = append(candidates, account)
 		}
 	}
@@ -179,7 +220,7 @@ func (p *Pool) pick(sessionKey string) (*store.Account, error) {
 	return chosen, nil
 }
 
-func routable(account *store.Account, inflight int, now time.Time, settings config.Settings) bool {
+func routable(account *store.Account, inflight int, now time.Time, settings config.Settings, ignoreCreditGuard bool) bool {
 	if !account.Enabled {
 		return false
 	}
@@ -216,7 +257,7 @@ func routable(account *store.Account, inflight int, now time.Time, settings conf
 	// scheduled again: a day-old zero would otherwise strand capacity that a
 	// single request refills, and the upstream remains the final authority on
 	// whether a request is affordable.
-	if settings.Signin.SkipZeroCredit && account.Credit.Exhausted() &&
+	if !ignoreCreditGuard && settings.Signin.SkipZeroCredit && account.Credit.Exhausted() &&
 		now.Sub(account.Credit.SyncedAt) < settings.CreditFresh() {
 		return false
 	}
@@ -327,7 +368,7 @@ func (p *Pool) Summary() (total, active, cooldown, disabled, invalid, routableCo
 		default:
 			active++
 		}
-		if routable(account, p.inflight[account.ID], now, settings) {
+		if routable(account, p.inflight[account.ID], now, settings, false) {
 			routableCount++
 		}
 	}

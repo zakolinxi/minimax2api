@@ -39,6 +39,13 @@ export function formatDateTime(value?: string | number | null, locale = "zh-CN")
   }).format(date);
 }
 
+/** Date without a time, for values that are whole days such as an expiry. */
+export function formatDate(value?: string | number | null, locale = "zh-CN"): string {
+  const date = parseInstant(value);
+  if (!date) return "—";
+  return new Intl.DateTimeFormat(locale, { year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+}
+
 export function formatRelative(value?: string | number | null, locale = "zh-CN"): string {
   const date = parseInstant(value);
   if (!date) return "—";

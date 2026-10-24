@@ -4,7 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tooltip } from "@/components/ui/tooltip";
 import type { AccountDTO, AccountStatus } from "@/features/accounts/accounts-api";
 import { cn } from "@/shared/lib/cn";
-import { formatRelative } from "@/shared/lib/format";
+import { formatDate, formatDateTime, formatRelative, hasInstant } from "@/shared/lib/format";
 
 const STATUS_TONE: Record<AccountStatus, string> = {
   active: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
@@ -16,6 +16,9 @@ const STATUS_TONE: Record<AccountStatus, string> = {
 export function AccountNameCell({ account }: { account: AccountDTO }) {
   const { t, i18n } = useTranslation();
   const mainland = account.region === "cn";
+  const tier = account.credit ? account.credit.tokenPlanTier.trim() || account.credit.planName.trim() : "";
+  const expiresAt = account.credit?.tokenPlanExpiresAt ?? "";
+  const expired = hasInstant(expiresAt) && Date.parse(expiresAt) <= Date.now();
   return (
     <div className="min-w-0 max-w-64">
       <div className="flex items-center gap-1.5">
@@ -37,6 +40,25 @@ export function AccountNameCell({ account }: { account: AccountDTO }) {
         ) : null}
       </div>
       <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground" title={account.identifier || account.tokenMasked}>
+        {/* The plan column is hidden on phones, where adding a fifth column
+            pushed the balance off the first screen. The state still has to be
+            visible there — it decides whether H3 may route here at all — so it
+            rides on the identifier line instead. */}
+        <span
+          className={cn(
+            account.subscribed && !expired && "text-emerald-600 dark:text-emerald-300",
+            expired && "text-destructive",
+            "md:hidden",
+          )}
+        >
+          {account.credit ? tier || t("accounts.unsubscribed") : t("accounts.subscriptionUnknown")}
+          {hasInstant(expiresAt)
+            ? ` · ${expired
+                ? t("accounts.expiredOn", { time: formatDate(expiresAt, i18n.language) })
+                : t("accounts.expiresOn", { time: formatDate(expiresAt, i18n.language) })}`
+            : ""}
+          {" · "}
+        </span>
         {account.identifier || account.tokenMasked}
       </p>
       {account.remark ? (
@@ -91,6 +113,65 @@ export function AccountStatusCell({ account }: { account: AccountDTO }) {
       ) : null}
       {account.failCount > 0 ? (
         <span className="text-[10px] text-muted-foreground tabular-nums">失败 {account.failCount}</span>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Plan status for one account.
+ *
+ * "Unsynced" is a state of its own, not a polite word for "free": with no
+ * membership reading the pool will not route a plan-only model here at all, so
+ * the operator needs to tell "refresh the balance" apart from "buy a plan".
+ */
+export function AccountPlanCell({ account }: { account: AccountDTO }) {
+  const { t, i18n } = useTranslation();
+  if (!account.credit) {
+    return (
+      <Tooltip label={t("accounts.creditUnknown")}>
+        <span className="text-[11px] text-muted-foreground">{t("accounts.subscriptionUnknown")}</span>
+      </Tooltip>
+    );
+  }
+
+  // The Token Plan tier is the subscription the plan-only models route on; the
+  // membership name is the older label and stays as a fallback for readings
+  // that predate the Token Plan fields.
+  const tier = account.credit.tokenPlanTier.trim() || account.credit.planName.trim();
+  const expiresAt = account.credit.tokenPlanExpiresAt;
+  const expired = hasInstant(expiresAt) && Date.parse(expiresAt) <= Date.now();
+  const status = expired
+    ? t("accounts.subscriptionExpired")
+    : account.subscribed
+      ? t("accounts.subscribed")
+      : t("accounts.unsubscribed");
+
+  return (
+    <div className="min-w-0 space-y-0.5">
+      <Tooltip label={status}>
+        <span
+          className={cn(
+            "inline-flex h-5 items-center rounded-full px-2 text-[11px] leading-none",
+            account.subscribed && !expired
+              ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+              : "bg-muted text-muted-foreground",
+          )}
+        >
+          {tier || t("accounts.unsubscribed")}
+        </span>
+      </Tooltip>
+      {hasInstant(expiresAt) ? (
+        <p
+          className={cn("truncate text-[10px]", expired ? "text-destructive" : "text-muted-foreground")}
+          title={formatDateTime(expiresAt, i18n.language)}
+        >
+          {expired
+            ? t("accounts.expiredOn", { time: formatDate(expiresAt, i18n.language) })
+            : t("accounts.expiresOn", { time: formatDate(expiresAt, i18n.language) })}
+        </p>
+      ) : account.subscribed ? (
+        <p className="truncate text-[10px] text-muted-foreground">{t("accounts.expiryUnknown")}</p>
       ) : null}
     </div>
   );

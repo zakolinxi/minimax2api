@@ -35,6 +35,10 @@ export type ModelDTO = {
   // The upstream's thinking_config.mode: forced_on, switchable or forced_off.
   // Absent means the model has no thinking control at all.
   thinkingMode?: string;
+  // Plan-only models (the H3 pair) are routed exclusively to accounts whose
+  // membership sync reports a paid plan; there is no console switch for this,
+  // because it describes the upstream's requirement rather than local policy.
+  subscriptionOnly?: boolean;
   enabled: boolean;
   builtin: boolean;
   description: string;
