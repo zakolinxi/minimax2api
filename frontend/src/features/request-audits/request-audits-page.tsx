@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Eye, RefreshCw, Search, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -35,13 +35,19 @@ export function RequestAuditsPage() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [detail, setDetail] = useState<AuditDTO | null>(null);
   const [clearOpen, setClearOpen] = useState(false);
 
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(search), 300);
+    return () => window.clearTimeout(timer);
+  }, [search]);
+
   const auditsQuery = useQuery({
-    queryKey: ["audits", page, pageSize, search, statusFilter],
-    queryFn: () => listAudits({ page, pageSize, search: search || undefined, status: statusFilter || undefined }),
+    queryKey: ["audits", page, pageSize, debouncedSearch, statusFilter],
+    queryFn: () => listAudits({ page, pageSize, search: debouncedSearch || undefined, status: statusFilter || undefined }),
     placeholderData: (previous) => previous,
   });
 

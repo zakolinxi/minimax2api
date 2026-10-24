@@ -415,6 +415,7 @@ func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
 	status := query.Get("status")
 	kind := query.Get("kind")
 	group := query.Get("group")
+	subscribed := query.Get("subscribed")
 	sortBy := query.Get("sortBy")
 	sortOrder := query.Get("sortOrder")
 
@@ -431,6 +432,11 @@ func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		if group != "" && account.Group != group {
 			continue
+		}
+		if subscribed != "" {
+			if wanted := subscribed == "true"; account.Subscribed() != wanted {
+				continue
+			}
 		}
 		if search != "" {
 			haystack := strings.ToLower(account.Name + " " + account.Remark + " " + account.Group + " " +
@@ -1653,6 +1659,11 @@ func (a *API) listAudits(w http.ResponseWriter, r *http.Request) {
 	search := strings.ToLower(strings.TrimSpace(query.Get("search")))
 	status := query.Get("status")
 
+	modelNames := map[string]string{}
+	for _, model := range a.store.ListModels() {
+		modelNames[model.ID] = model.Name
+	}
+
 	audits := a.store.ListAudits()
 	filtered := make([]*store.Audit, 0, len(audits))
 	for _, audit := range audits {
@@ -1662,11 +1673,8 @@ func (a *API) listAudits(w http.ResponseWriter, r *http.Request) {
 		if status == "failed" && audit.Status < 400 {
 			continue
 		}
-		if search != "" {
-			haystack := strings.ToLower(audit.ID + " " + audit.Model + " " + audit.KeyName + " " + audit.AccountName)
-			if !strings.Contains(haystack, search) {
-				continue
-			}
+		if search != "" && !auditMatchesSearch(audit, search, modelNames[audit.Model]) {
+			continue
 		}
 		filtered = append(filtered, audit)
 	}
@@ -1681,6 +1689,24 @@ func (a *API) listAudits(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items": filtered[start:end], "total": total, "page": page, "pageSize": pageSize,
 	})
+}
+
+// auditMatchesSearch reports whether any field of the record contains needle,
+// which the caller has already lowercased. Payloads are part of the index on
+// purpose: an operator chasing a bad answer remembers text they saw in the
+// request, not an id they would have no reason to keep.
+func auditMatchesSearch(audit *store.Audit, needle, modelName string) bool {
+	fields := [...]string{
+		audit.ID, audit.Model, modelName, audit.KeyName, audit.AccountName,
+		audit.IP, audit.UserAgent, strconv.Itoa(audit.Status),
+		audit.Error, audit.RequestBody, audit.ResponseBody,
+	}
+	for _, field := range fields {
+		if field != "" && strings.Contains(strings.ToLower(field), needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *API) auditDetail(w http.ResponseWriter, r *http.Request) {

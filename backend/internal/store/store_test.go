@@ -458,6 +458,85 @@ func TestMergeBuiltinModelsIsIdempotent(t *testing.T) {
 	}
 }
 
+// The plan requirement is adopted by existing installs the same way the
+// upstream id is: it is a fact the console cannot edit, so a false value on a
+// stored built-in is a freeze of an older catalogue rather than a choice. The
+// old billing note is rewritten only while it is still the built-in's own
+// wording, so an operator's description edit survives.
+func TestMergeBuiltinModelsAdoptsSubscriptionRequirement(t *testing.T) {
+	modelByID := func(models []*ModelConfig, id string) *ModelConfig {
+		for _, model := range models {
+			if model.ID == id {
+				return model
+			}
+		}
+		return nil
+	}
+
+	stored := BuiltinModels()
+	for _, model := range stored {
+		model.SubscriptionOnly = false
+	}
+	modelByID(stored, "minimax-h3").Description = legacyModelDescriptions["minimax-h3"]
+	modelByID(stored, "minimax-h3-max").Description = "我自己写的说明"
+
+	merged, changed := MergeBuiltinModels(stored)
+	if !changed {
+		t.Fatal("a catalogue without the plan requirement should report a change")
+	}
+	for _, id := range []string{"minimax-h3", "minimax-h3-max"} {
+		if got := modelByID(merged, id); got == nil || !got.SubscriptionOnly {
+			t.Errorf("model %q did not adopt the plan requirement", id)
+		}
+	}
+	if got, want := modelByID(merged, "minimax-h3").Description, modelByID(BuiltinModels(), "minimax-h3").Description; got != want {
+		t.Errorf("the stale billing note survived: %q", got)
+	}
+	if got := modelByID(merged, "minimax-h3-max").Description; got != "我自己写的说明" {
+		t.Errorf("the merge overwrote an operator's description: %q", got)
+	}
+	if _, changedAgain := MergeBuiltinModels(merged); changedAgain {
+		t.Error("merging an already-updated catalogue reported a change")
+	}
+}
+
+// Subscribed is the routing rule for plan-only models, so every boundary of it
+// is pinned: no reading is not a subscription, and the free label is matched
+// without case or surrounding space.
+func TestAccountSubscribed(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name   string
+		credit *Credit
+		want   bool
+	}{
+		{"no reading", nil, false},
+		{"empty plan", &Credit{}, false},
+		{"free", &Credit{PlanName: "Free"}, false},
+		{"free lowercase and spaced", &Credit{PlanName: " free "}, false},
+		{"basic", &Credit{PlanName: "Basic"}, true},
+		{"pro", &Credit{PlanName: "Pro"}, true},
+		{"token plan expiry in the future", &Credit{TokenPlanTier: "Pro", TokenPlanExpiresAt: now.Add(24 * time.Hour)}, true},
+		{"token plan without a date", &Credit{TokenPlanTier: "Basic"}, true},
+		{"token plan expired", &Credit{TokenPlanTier: "Pro", TokenPlanExpiresAt: now.Add(-time.Hour)}, false},
+		// The Token Plan reading wins: an expired subscription must not stay in
+		// rotation just because the older membership label still says Pro.
+		{"expired token plan with a paid membership name", &Credit{PlanName: "Pro", TokenPlanTier: "Pro", TokenPlanExpiresAt: now.Add(-time.Hour)}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			account := &Account{Credit: tc.credit}
+			if got := account.Subscribed(); got != tc.want {
+				t.Fatalf("Subscribed() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	var missing *Account
+	if missing.Subscribed() {
+		t.Error("a nil account reported a subscription")
+	}
+}
+
 // An upstream model id added to an existing built-in has to reach installs that
 // already hold that entry. There is no console and no API that sets
 // UpstreamModel, so an empty value on a stored built-in is a freeze of an older

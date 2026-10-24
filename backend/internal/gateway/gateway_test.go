@@ -214,6 +214,10 @@ func (h *harness) addAccount(t *testing.T, name, token string, priority int) *st
 		// token, and a missing agent id opens no session at all.
 		UserID: "1", AgentID: "443154487857417",
 		Priority: priority, MaxConcurrent: 2, Enabled: true,
+		// A paid plan by default: the H3 models are plan-only, and most video
+		// tests here need an account the pool will actually route them to.
+		// Tests about the plan gate downgrade the account explicitly.
+		Credit: &store.Credit{Total: 1000, PlanName: "Pro", SyncedAt: time.Now()},
 	}
 	if err := h.store.AddAccount(account); err != nil {
 		t.Fatalf("add account %s: %v", name, err)
@@ -1445,6 +1449,69 @@ func TestVideoTurnsCarryTheVideoClientIntent(t *testing.T) {
 	}
 	if got := (*bodies)[1]["client_intent"]; got != minimax.VideoClientIntent {
 		t.Errorf("video turn client_intent = %v, want %q", got, minimax.VideoClientIntent)
+	}
+}
+
+// H3 and H3-Max became plan-only upstream in October 2026. A free account is
+// charged for the turn and then refused, so the pool must not even try one:
+// the turn rides on the subscribed account while the free account stays idle,
+// and both counters say so.
+func TestVideoModelsSkipAccountsWithoutAPlan(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("已提交")))
+	free := h.addAccount(t, "free", "token-free", 0)
+	paid := h.addAccount(t, "paid", "token-paid", 10)
+	h.store.SaveAccountState(free.ID, func(account *store.Account) {
+		account.Credit = &store.Credit{Total: 1000, PlanName: "Free", SyncedAt: time.Now()}
+	})
+
+	rec := h.video(t, map[string]any{"model": "minimax-h3-max", "prompt": "一只猫在弹钢琴"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	reloadedFree, _ := h.store.AccountByID(free.ID)
+	reloadedPaid, _ := h.store.AccountByID(paid.ID)
+	if reloadedFree.SuccessCount != 0 {
+		t.Errorf("the free account served %d video turns, want 0", reloadedFree.SuccessCount)
+	}
+	if reloadedPaid.SuccessCount != 1 {
+		t.Errorf("the subscribed account served %d video turns, want 1", reloadedPaid.SuccessCount)
+	}
+}
+
+// With no subscribed account the request must fail before reaching upstream:
+// a refusal after the turn would still have spent the account's points. 503
+// says the pool lacks the required kind of account, not that the upstream is
+// broken. Both surfaces are checked because the chat endpoint can name video
+// models too.
+func TestPlanOnlyModelWithoutAPlanAccountFailsFast(t *testing.T) {
+	var turns atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		turns.Add(1)
+		acceptsEverything(upstreamText("已提交"))(w, r)
+	})
+	account := h.addAccount(t, "free", "token-free", 0)
+	h.store.SaveAccountState(account.ID, func(target *store.Account) {
+		target.Credit = &store.Credit{Total: 1000, PlanName: "Free", SyncedAt: time.Now()}
+	})
+
+	rec := h.video(t, map[string]any{"model": "minimax-h3-max", "prompt": "一只猫在弹钢琴"})
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("video status = %d, want 503; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "subscription") {
+		t.Errorf("video body = %s, want the subscription requirement named", rec.Body.String())
+	}
+
+	chat := h.chat(t, map[string]any{
+		"model":    "minimax-h3",
+		"messages": []any{map[string]any{"role": "user", "content": "一只猫在弹钢琴"}},
+	}, h.key)
+	if chat.Code != http.StatusServiceUnavailable {
+		t.Fatalf("chat status = %d, want 503; body = %s", chat.Code, chat.Body.String())
+	}
+
+	if turns.Load() != 0 {
+		t.Errorf("upstream was called %d times, want 0", turns.Load())
 	}
 }
 

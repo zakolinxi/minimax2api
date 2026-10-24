@@ -86,13 +86,20 @@ func (c *SigninClaim) IsDuplicate() bool {
 	return c != nil && c.Result == SigninClaimDuplicate
 }
 
-// CreditInfo is the account's live balance.
+// CreditInfo is the account's live balance and membership readings.
+//
+// PlanName/PlanType are the older membership fields. TokenPlanTier and
+// TokenPlanExpiresAt are the subscription the plan-gated models actually need;
+// the web client renders the tier label directly and formats the expiry, which
+// is how these names were recovered.
 type CreditInfo struct {
-	Total     int    `json:"total"`
-	Free      int    `json:"free"`
-	Purchased int    `json:"purchased"`
-	PlanName  string `json:"planName"`
-	PlanType  int    `json:"planType"`
+	Total              int       `json:"total"`
+	Free               int       `json:"free"`
+	Purchased          int       `json:"purchased"`
+	PlanName           string    `json:"planName"`
+	PlanType           int       `json:"planType"`
+	TokenPlanTier      string    `json:"tokenPlanTier"`
+	TokenPlanExpiresAt time.Time `json:"tokenPlanExpiresAt"`
 }
 
 // ------------------------------------------------------------------- request
@@ -421,8 +428,10 @@ func (c *Client) Credit(ctx context.Context, cred Credential) (*CreditInfo, erro
 	core := coreOf(payload)
 
 	info := &CreditInfo{
-		PlanName: stringOf(core["plan_name"]),
-		PlanType: intOf(core["plan_type"]),
+		PlanName:           stringOf(core["plan_name"]),
+		PlanType:           intOf(core["plan_type"]),
+		TokenPlanTier:      stringOf(core["token_plan_tier"]),
+		TokenPlanExpiresAt: timeFromEpoch(core["token_plan_expires_at"]),
 	}
 	if summary, ok := core["op_credit_summary"].(map[string]any); ok {
 		info.Total = numberOf(summary["total_remaining_amount"])
@@ -606,6 +615,37 @@ func timeFromMillis(value any) time.Time {
 		return time.Time{}
 	}
 	return time.UnixMilli(int64(millis))
+}
+
+// timeFromEpoch reads an epoch timestamp whose width is not documented: the
+// membership endpoint is not consistent about seconds versus milliseconds, and
+// the value may arrive as a number or a string. The magnitude separates them —
+// seconds stay below 1e12 until the year 33658.
+func timeFromEpoch(value any) time.Time {
+	var raw int64
+	switch node := value.(type) {
+	case float64:
+		raw = int64(node)
+	case int64:
+		raw = node
+	case int:
+		raw = int64(node)
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(node), 10, 64)
+		if err != nil {
+			return time.Time{}
+		}
+		raw = parsed
+	default:
+		return time.Time{}
+	}
+	if raw <= 0 {
+		return time.Time{}
+	}
+	if raw < 1e12 {
+		return time.Unix(raw, 0)
+	}
+	return time.UnixMilli(raw)
 }
 
 func boolOf(value any) bool {

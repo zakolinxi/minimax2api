@@ -373,6 +373,33 @@ type turnResult struct {
 	Streamed    bool
 }
 
+// errSubscriptionRequired reports that a plan-only model has no subscribed
+// account to ride on. It is a capacity condition, not an upstream failure, and
+// upstreamStatus maps it to 503.
+var errSubscriptionRequired = errors.New("subscription account required")
+
+// acquireAccount borrows an account for one turn. Plan-only models get a
+// filtered pool: the upstream charges a free account for the turn and only
+// then refuses it, so trying one costs more than waiting for a plan account.
+func (g *Gateway) acquireAccount(ctx context.Context, sessionKey string, model *store.ModelConfig) (*pool.Lease, error) {
+	if model == nil || !model.SubscriptionOnly {
+		return g.pool.Acquire(ctx, sessionKey)
+	}
+	lease, err := g.pool.AcquireWith(ctx, pool.AcquireOptions{
+		SessionKey: sessionKey,
+		Eligible: func(account *store.Account) bool {
+			return account.Subscribed()
+		},
+		// These models are billed against the plan, so a zero credit balance
+		// says nothing about whether the account can serve them.
+		IgnoreCreditGuard: true,
+	})
+	if errors.Is(err, pool.ErrNoEligible) {
+		return nil, fmt.Errorf("%w: %s needs a Token Plan account and the pool has none", errSubscriptionRequired, model.ID)
+	}
+	return lease, err
+}
+
 // runTurn leases an account, calls the upstream, and retries across accounts
 // while nothing has been committed to the client.
 //
@@ -400,7 +427,7 @@ func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, er
 
 	var lastErr error
 	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
-		lease, err := g.pool.Acquire(ctx, req.SessionKey)
+		lease, err := g.acquireAccount(ctx, req.SessionKey, req.Model)
 		if err != nil {
 			return out, err
 		}
@@ -1327,7 +1354,7 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 	)
 
 	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
-		lease, err := g.pool.Acquire(r.Context(), "")
+		lease, err := g.acquireAccount(r.Context(), "", model)
 		if err != nil {
 			lastErr = err
 			break
@@ -1723,10 +1750,16 @@ func isPoolExhausted(err error) bool {
 // A request the upstream refused is the caller's problem, so the upstream's own
 // status travels back and the caller can fix what it sent. Everything else —
 // a dead account, an exhausted pool, a 5xx — is a gateway failure and stays a
-// 502, because the caller cannot do anything about it.
+// 502, because the caller cannot do anything about it. A missing subscription
+// account is the exception: the pool has no capacity of the required kind, so
+// 503 says "try again once a subscribed account is in the pool" rather than
+// "the upstream broke".
 func upstreamStatus(err error) int {
 	if status := minimax.UpstreamStatus(err); status != 0 {
 		return status
+	}
+	if errors.Is(err, errSubscriptionRequired) {
+		return http.StatusServiceUnavailable
 	}
 	return http.StatusBadGateway
 }

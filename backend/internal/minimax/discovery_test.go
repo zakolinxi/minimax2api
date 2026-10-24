@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"minimax2api/internal/config"
 )
@@ -117,6 +118,64 @@ func TestCreateSessionReadsTheNumericIDFromTheTopLevel(t *testing.T) {
 	}
 	if id != "443323308642590" {
 		t.Errorf("id = %q, want the top-level session_id", id)
+	}
+}
+
+// The membership endpoint carries the Token Plan subscription beside the credit
+// balance. The web client renders the tier label and formats the expiry, which
+// is how both field names were recovered; this pins that shape so a rename on
+// our side cannot silently blank the console.
+func TestCreditReadsTheTokenPlanTierAndExpiry(t *testing.T) {
+	const expiresMs int64 = 1792339200000
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"plan_name":"Free","plan_type":0,` +
+			`"token_plan_tier":"Pro","token_plan_expires_at":1792339200000,` +
+			`"op_credit_summary":{"total_remaining_amount":"400"}},` +
+			`"base_resp":{"status_code":0,"status_msg":"ok"}}`))
+	}))
+	defer server.Close()
+
+	settings := config.DefaultSettings(t.TempDir())
+	settings.Upstream.BaseURL = server.URL
+	client := New(func() config.Settings { return settings })
+
+	info, err := client.Credit(context.Background(), Credential{Token: "token", UserID: "1"})
+	if err != nil {
+		t.Fatalf("Credit: %v", err)
+	}
+	if info.TokenPlanTier != "Pro" {
+		t.Errorf("tier = %q, want Pro", info.TokenPlanTier)
+	}
+	if !info.TokenPlanExpiresAt.Equal(time.UnixMilli(expiresMs)) {
+		t.Errorf("expiry = %s, want %s", info.TokenPlanExpiresAt, time.UnixMilli(expiresMs))
+	}
+	if info.Total != 400 {
+		t.Errorf("total = %d, want 400", info.Total)
+	}
+}
+
+// The expiry field's width is not documented, and the two plausible widths are
+// told apart by magnitude. Seconds are accepted rather than silently turning
+// into a date in 1970.
+func TestTimeFromEpochAcceptsSecondsAndMillis(t *testing.T) {
+	want := time.UnixMilli(1792339200000)
+	cases := []any{
+		float64(1792339200000), // milliseconds, as JSON decodes them
+		"1792339200000",        // milliseconds as a string
+		float64(1792339200),    // seconds
+		"1792339200",           // seconds as a string
+	}
+	for _, value := range cases {
+		if got := timeFromEpoch(value); !got.Equal(want) {
+			t.Errorf("timeFromEpoch(%v) = %s, want %s", value, got, want)
+		}
+	}
+	if got := timeFromEpoch(nil); !got.IsZero() {
+		t.Errorf("timeFromEpoch(nil) = %s, want zero", got)
+	}
+	if got := timeFromEpoch("not-a-number"); !got.IsZero() {
+		t.Errorf("timeFromEpoch(garbage) = %s, want zero", got)
 	}
 }
 

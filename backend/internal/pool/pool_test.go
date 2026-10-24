@@ -237,10 +237,10 @@ func TestRoutableTreatsZeroMaxConcurrentAsOne(t *testing.T) {
 		MaxConcurrent: 0,
 	}
 
-	if !routable(account, 0, now, config.Settings{}) {
+	if !routable(account, 0, now, config.Settings{}, false) {
 		t.Fatal("account with unset MaxConcurrent should accept one request")
 	}
-	if routable(account, 1, now, config.Settings{}) {
+	if routable(account, 1, now, config.Settings{}, false) {
 		t.Fatal("unset MaxConcurrent should cap at one, not allow two")
 	}
 }
@@ -262,30 +262,30 @@ func TestRoutableSkipsSpentAccounts(t *testing.T) {
 
 	spent := *base
 	spent.Credit = &store.Credit{Total: 0, SyncedAt: now.Add(-5 * time.Minute)}
-	if routable(&spent, 0, now, guard) {
+	if routable(&spent, 0, now, guard, false) {
 		t.Error("a fresh zero balance should hold the account out of rotation")
 	}
 
 	stale := *base
 	stale.Credit = &store.Credit{Total: 0, SyncedAt: now.Add(-2 * time.Hour)}
-	if !routable(&stale, 0, now, guard) {
+	if !routable(&stale, 0, now, guard, false) {
 		t.Error("a stale zero balance should not hold the account out of rotation")
 	}
 
 	funded := *base
 	funded.Credit = &store.Credit{Total: 400, SyncedAt: now}
-	if !routable(&funded, 0, now, guard) {
+	if !routable(&funded, 0, now, guard, false) {
 		t.Error("an account with credit should be routable")
 	}
 
 	// No reading at all means unknown, not spent.
-	if !routable(base, 0, now, guard) {
+	if !routable(base, 0, now, guard, false) {
 		t.Error("an account with no balance reading should be routable")
 	}
 
 	unguarded := config.Settings{}
 	unguarded.Signin.CreditFreshMin = 60
-	if !routable(&spent, 0, now, unguarded) {
+	if !routable(&spent, 0, now, unguarded, false) {
 		t.Error("a zero balance should be ignored while SkipZeroCredit is off")
 	}
 }
@@ -296,6 +296,73 @@ func TestAcquireReportsEmptyPool(t *testing.T) {
 	if _, err := f.pool.Acquire(context.Background(), ""); !errors.Is(err, ErrNoAccount) {
 		t.Fatalf("err = %v, want ErrNoAccount", err)
 	}
+}
+
+// --- request filters -------------------------------------------------------
+
+// A filter is checked before routability, so an ineligible account never takes
+// an in-flight slot, and the pool says so immediately when nothing can match:
+// waiting cannot turn a free account into a subscribed one.
+func TestAcquireWithFiltersAccounts(t *testing.T) {
+	f := newFixture(t)
+	f.addAccount(t, "free", 0)
+	paid := f.addAccount(t, "paid", 10)
+	f.store.SaveAccountState(paid.ID, func(account *store.Account) {
+		account.Credit = &store.Credit{PlanName: "Pro", SyncedAt: time.Now()}
+	})
+
+	lease, err := f.pool.AcquireWith(context.Background(), AcquireOptions{
+		Eligible: func(account *store.Account) bool { return account.Subscribed() },
+	})
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer lease.Release(nil)
+	if lease.Account.ID != paid.ID {
+		t.Fatalf("selected %q, want the subscribed account", lease.Account.ID)
+	}
+}
+
+func TestAcquireWithNoEligibleAccountFailsFast(t *testing.T) {
+	f := newFixture(t)
+	f.addAccount(t, "free", 0)
+	f.settings.Routing.CapacityWaitSec = 30
+
+	start := time.Now()
+	_, err := f.pool.AcquireWith(context.Background(), AcquireOptions{
+		Eligible: func(account *store.Account) bool { return account.Subscribed() },
+	})
+	if !errors.Is(err, ErrNoEligible) {
+		t.Fatalf("err = %v, want ErrNoEligible", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("ErrNoEligible waited for capacity (%s)", elapsed)
+	}
+}
+
+// Plan-billed models pass IgnoreCreditGuard: a zero balance is not evidence
+// they are unaffordable, and the guard would otherwise hold exactly the
+// subscribed accounts they need out of rotation.
+func TestAcquireWithIgnoreCreditGuard(t *testing.T) {
+	f := newFixture(t)
+	f.settings.Signin.SkipZeroCredit = true
+	f.settings.Signin.CreditFreshMin = 60
+	paid := f.addAccount(t, "paid", 0)
+	f.store.SaveAccountState(paid.ID, func(account *store.Account) {
+		account.Credit = &store.Credit{Total: 0, PlanName: "Pro", SyncedAt: time.Now()}
+	})
+
+	guarded := AcquireOptions{Eligible: func(account *store.Account) bool { return account.Subscribed() }}
+	if _, err := f.pool.AcquireWith(context.Background(), guarded); !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("guarded err = %v, want ErrNoCapacity", err)
+	}
+
+	guarded.IgnoreCreditGuard = true
+	lease, err := f.pool.AcquireWith(context.Background(), guarded)
+	if err != nil {
+		t.Fatalf("unguarded acquire: %v", err)
+	}
+	lease.Release(nil)
 }
 
 func TestAcquireHonoursContextCancellation(t *testing.T) {
