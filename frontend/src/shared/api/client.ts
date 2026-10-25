@@ -70,7 +70,11 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
     // redirect — and with no stored token there is nothing to clear.
     if (response.status === 401 && path !== "/admin/api/auth/login" && readToken()) {
       writeToken("");
-      window.location.assign("/login");
+      // Already sitting on the login page (a stale token in storage gets
+      // probed on mount): clear it and stay put instead of reloading.
+      if (window.location.pathname !== "/login") {
+        window.location.assign("/login");
+      }
     }
     throw new ApiError(message, response.status, code);
   }

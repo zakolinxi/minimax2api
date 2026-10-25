@@ -163,10 +163,12 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	}
 	username := strings.TrimSpace(request.Username)
 
-	// Brute force lockout. The key is the connection's source address: an
-	// X-Forwarded-For header is attacker-controlled and would let a client
-	// rotate its identity per attempt.
-	host := remoteHost(r)
+	// Brute force lockout, keyed by source address. Without a trusted proxy
+	// every connection carries its own address and the header is ignored — an
+	// attacker could otherwise rotate its identity per attempt. Behind a proxy
+	// the key follows the trusted view instead: keyed on the proxy's address,
+	// one attacker's failures would lock the operator out with them.
+	host := a.clientAddress(r)
 	if remaining, locked := a.loginLocked(host); locked {
 		w.Header().Set("retry-after", strconv.Itoa(int(remaining.Seconds())+1))
 		writeError(w, http.StatusTooManyRequests, fmt.Sprintf("失败次数过多，请 %d 秒后重试", int(remaining.Seconds())+1))
@@ -2207,6 +2209,27 @@ func remoteHost(r *http.Request) string {
 	return host
 }
 
+// clientAddress reports where a request came from, honouring
+// settings.Security.TrustProxy. The last X-Forwarded-For entry is used, not
+// the first: an appending proxy (`$proxy_add_x_forwarded_for`) adds the client
+// it actually saw to the right-hand end, so a caller cannot forge its address
+// by pre-sending the header — while the first entry is whatever the client
+// chose to put there.
+func (a *API) clientAddress(r *http.Request) string {
+	// settings may be nil on a hand-built API (tests); the safe answer is the
+	// connection address, which trusts nothing.
+	if a.settings == nil {
+		return remoteHost(r)
+	}
+	if a.settings().Security.TrustProxy {
+		if forwarded := r.Header.Get("x-forwarded-for"); forwarded != "" {
+			parts := strings.Split(forwarded, ",")
+			return strings.TrimSpace(parts[len(parts)-1])
+		}
+	}
+	return remoteHost(r)
+}
+
 // recordAdminAction writes an audit entry for a console-initiated mutation.
 // The gateway records API traffic on its own; these entries exist so the audit
 // log also answers "who changed what in the console". The optional detail
@@ -2215,7 +2238,7 @@ func (a *API) recordAdminAction(r *http.Request, action string, detail ...string
 	entry := &store.Audit{
 		ID:        "req_" + randomID(10),
 		CreatedAt: time.Now(),
-		IP:        remoteHost(r),
+		IP:        a.clientAddress(r),
 		UserAgent: r.Header.Get("user-agent"),
 		Action:    action,
 	}
