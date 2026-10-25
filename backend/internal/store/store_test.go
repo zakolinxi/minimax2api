@@ -853,3 +853,432 @@ func TestExpiredCooldownReadsAsActive(t *testing.T) {
 		t.Fatalf("live cooldown = %s/%s, want cooldown with its deadline kept", got.Status, got.CooldownUntil)
 	}
 }
+
+// --- every pointer that leaves the store is detached -------------------------
+
+// ListClientKeys, ClientKeyByValue, CreateClientKey and UpdateClientKey used to
+// hand out the live objects, which raced with BumpClientKeyUsage writing the
+// same structs under the write lock.
+func TestClientKeySnapshotsAreDetached(t *testing.T) {
+	st := newTestStore(t)
+
+	created, err := st.CreateClientKey("probe", 10, 2)
+	if err != nil {
+		t.Fatalf("create client key: %v", err)
+	}
+
+	listed := st.ListClientKeys()
+	if len(listed) != 1 {
+		t.Fatalf("ListClientKeys returned %d keys, want 1", len(listed))
+	}
+	if listed[0] == created {
+		t.Fatal("ListClientKeys returned the very pointer CreateClientKey handed out")
+	}
+
+	// Mutating every shape of snapshot must not reach the store.
+	snapshot := listed[0]
+	snapshot.Name = "tampered"
+	snapshot.RPMLimit = 999
+	snapshot.TotalRequests = 999
+	if byValue, ok := st.ClientKeyByValue(created.Key); !ok {
+		t.Fatal("ClientKeyByValue missed the key it just created")
+	} else {
+		byValue.Enabled = false
+	}
+	updated, err := st.UpdateClientKey(created.ID, func(k *ClientKey) { k.RPMLimit = 30 })
+	if err != nil {
+		t.Fatalf("update client key: %v", err)
+	}
+	updated.Enabled = false
+	updated.TotalRequests = 12345
+
+	fresh := st.ListClientKeys()
+	if len(fresh) != 1 {
+		t.Fatalf("ListClientKeys returned %d keys, want 1", len(fresh))
+	}
+	got := fresh[0]
+	if got.Name == "tampered" || got.RPMLimit != 30 || got.TotalRequests != 0 || !got.Enabled {
+		t.Fatalf("a returned client key aliased the store's own object: %+v", got)
+	}
+}
+
+// The model snapshots must be deep copies: the generation ranges are slices,
+// and a shared backing array would let a caller write into the live catalogue
+// without holding the lock.
+func TestModelSnapshotsAreDetached(t *testing.T) {
+	st := newTestStore(t)
+
+	models := st.ListModels()
+	var video, flash *ModelConfig
+	for _, model := range models {
+		switch model.ID {
+		case "minimax-h3":
+			video = model
+		case "minimax-m3.1-flash":
+			flash = model
+		}
+	}
+	if video == nil || flash == nil {
+		t.Fatalf("catalogue incomplete: video=%v flash=%v", video, flash)
+	}
+
+	video.Ratios[0] = "tampered"
+	video.Resolutions[0] = "tampered"
+	video.Durations[0] = 999
+	video.Enabled = false
+	flash.ContextWindows[0] = -1
+
+	updated, err := st.UpdateModel(video.ID, func(m *ModelConfig) { m.Description = "edited" })
+	if err != nil {
+		t.Fatalf("update model: %v", err)
+	}
+	updated.Name = "tampered"
+
+	for _, model := range st.ListModels() {
+		switch model.ID {
+		case "minimax-h3":
+			if !model.Enabled {
+				t.Fatal("mutating a returned model reached the store")
+			}
+			if model.Ratios[0] != "21:9" || model.Resolutions[0] != "768P" || model.Durations[0] != 5 {
+				t.Fatalf("a snapshot's slice shared a backing array with the store: %v %v %v",
+					model.Ratios, model.Resolutions, model.Durations)
+			}
+			if model.Name == "tampered" || model.Description != "edited" {
+				t.Fatalf("UpdateModel's return value aliased the live entry: %+v", model)
+			}
+		case "minimax-m3.1-flash":
+			if model.ContextWindows[0] != 512000 {
+				t.Fatalf("a snapshot's slice shared a backing array with the store: %v", model.ContextWindows)
+			}
+		}
+	}
+}
+
+// UpdateAccount must return a snapshot like every other read path, and
+// AddAccount must not leave the store aliasing the caller's object.
+func TestAccountMutationsReturnDetachedCopies(t *testing.T) {
+	st := newTestStore(t)
+
+	account := &Account{ID: "acc_1", Name: "primary", Token: "jwt-token-x", Enabled: true}
+	if err := st.AddAccount(account); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if account.ID == "" {
+		t.Fatal("AddAccount did not apply the generated id to the caller's object")
+	}
+
+	updated, err := st.UpdateAccount("acc_1", func(a *Account) { a.Priority = 7 })
+	if err != nil {
+		t.Fatalf("update account: %v", err)
+	}
+	updated.Priority = 999
+	updated.Token = "tampered"
+	// The caller keeps owning the object it passed in; the store must not.
+	account.Name = "tampered-after-add"
+
+	fresh, ok := st.AccountByID("acc_1")
+	if !ok {
+		t.Fatal("account missing")
+	}
+	if fresh.Priority != 7 || fresh.Token != "jwt-token-x" || fresh.Name != "primary" {
+		t.Fatalf("a returned account aliased the store's own object: %+v", fresh)
+	}
+}
+
+// The usage bumpers write the live objects under the write lock while request
+// handlers read the List* results without any lock. With live pointers handed
+// out this is exactly the race the detector catches; with detached copies it
+// must run clean under -race.
+func TestUsageCountersRaceFreeAgainstSnapshots(t *testing.T) {
+	st := newTestStore(t)
+	key, err := st.CreateClientKey("probe", 10, 2)
+	if err != nil {
+		t.Fatalf("create client key: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				st.BumpClientKeyUsage(key.ID)
+				st.RecordModelUsage("minimax-h3", 1, 100)
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for _, k := range st.ListClientKeys() {
+			k.TotalRequests = -1 // write through the snapshot
+		}
+		for _, m := range st.ListModels() {
+			m.Requests = -1
+		}
+		if k, ok := st.ClientKeyByValue(key.Key); ok {
+			k.Enabled = false
+		}
+	}
+	close(stop)
+	wg.Wait()
+
+	fresh := st.ListClientKeys()
+	if len(fresh) != 1 || fresh[0].TotalRequests < 0 || !fresh[0].Enabled {
+		t.Fatalf("snapshot writes leaked into the store: %+v", fresh)
+	}
+}
+
+// --- persistence of the paths that used to skip markDirty --------------------
+
+// AppendAudit, BumpClientKeyUsage, RecordModelUsage and AddMedia only changed
+// memory, so a crash lost everything since the last unrelated flush; and
+// PurgeAudits resurrected the records it had dropped. Every one of them must
+// survive a restart, and a purge must stay dead.
+func TestUsageAndAuditMutationsPersistAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir, "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	key, err := st.CreateClientKey("probe", 10, 2)
+	if err != nil {
+		t.Fatalf("create client key: %v", err)
+	}
+	st.AppendAudit(&Audit{ID: "audit-new", CreatedAt: time.Now(), KeyName: "probe"})
+	// Thirty days back is well beyond the default seven-day retention, so the
+	// purge below has something to drop.
+	st.AppendAudit(&Audit{ID: "audit-old", CreatedAt: time.Now().AddDate(0, 0, -30), KeyName: "probe"})
+	st.BumpClientKeyUsage(key.ID)
+	st.RecordModelUsage("minimax-h3", 2, 4096)
+	st.AddMedia(&MediaItem{ID: "media-1", Kind: "image", URL: "https://cdn/x.png", CreatedAt: time.Now()})
+
+	if err := st.Save(); err != nil {
+		t.Fatalf("flush store: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := Open(dir, "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	if got := reopened.ListAudits(); len(got) != 2 {
+		t.Fatalf("audits did not survive the restart: %d", len(got))
+	}
+	if keys := reopened.ListClientKeys(); len(keys) != 1 || keys[0].TotalRequests != 1 {
+		t.Fatalf("bumped usage did not survive the restart: %+v", keys)
+	}
+	if model, ok := reopened.ModelByID("minimax-h3"); !ok || model.Requests != 2 || model.Tokens != 4096 {
+		t.Fatalf("recorded model usage did not survive the restart: %+v", model)
+	}
+	if got := reopened.ListMedia(); len(got) != 1 {
+		t.Fatalf("media did not survive the restart: %d", len(got))
+	}
+
+	// The purge must reach the disk too, or the old record comes back on the
+	// next restart.
+	reopened.PurgeAudits()
+	if got := reopened.ListAudits(); len(got) != 1 || got[0].ID != "audit-new" {
+		t.Fatalf("purge dropped the wrong records: %+v", got)
+	}
+	if err := reopened.Save(); err != nil {
+		t.Fatalf("flush store: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	again, err := Open(dir, "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = again.Close() }()
+	if got := again.ListAudits(); len(got) != 1 || got[0].ID != "audit-new" {
+		t.Fatalf("a purged audit came back from the dead: %+v", got)
+	}
+}
+
+// A failed UpdateSettings must leave the live state, the published snapshot and
+// the file all untouched — previously the in-memory change survived while the
+// snapshot and the file never learned about it.
+func TestUpdateSettingsFailureLeavesStateUntouched(t *testing.T) {
+	st := newTestStore(t)
+
+	// A regular file where a directory is required makes MkdirAll fail.
+	blocked := filepath.Join(st.DataDir(), "blocked")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	before := st.Settings()
+
+	err := st.UpdateSettings(func(s *config.Settings) {
+		s.Media.GeneratedDir = filepath.Join(blocked, "generated")
+		s.Routing.CooldownBaseSec = 999
+	})
+	if err == nil {
+		t.Fatal("UpdateSettings succeeded although the media dir cannot be created")
+	}
+	if got := st.Settings(); got != before {
+		t.Fatalf("a failed UpdateSettings changed the live settings: %+v", got)
+	}
+
+	// And the file must not have learned about the abandoned change either.
+	if err := st.Save(); err != nil {
+		t.Fatalf("flush store: %v", err)
+	}
+	reopened, err := Open(st.DataDir(), "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	if got := reopened.Settings().Routing.CooldownBaseSec; got == 999 {
+		t.Fatal("the abandoned settings change reached the disk")
+	}
+	if got := reopened.Settings().Media.GeneratedDir; got == filepath.Join(blocked, "generated") {
+		t.Fatal("the abandoned media dir reached the disk")
+	}
+}
+
+// A corrupt state file must not be silently destroyed by the next successful
+// write: Open moves it aside, best effort, and refuses to start.
+func TestOpenBacksUpACorruptStateFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, stateFile)
+	if err := os.WriteFile(path, []byte("{ this is not json"), 0o600); err != nil {
+		t.Fatalf("seed corrupt file: %v", err)
+	}
+
+	st, err := Open(dir, "admin", "admin12345")
+	if err == nil {
+		_ = st.Close()
+		t.Fatal("Open accepted a corrupt state file")
+	}
+	matches, globErr := filepath.Glob(path + ".corrupt-*")
+	if globErr != nil || len(matches) != 1 {
+		t.Fatalf("the damaged file was not backed up: %v %v", matches, globErr)
+	}
+	content, readErr := os.ReadFile(matches[0])
+	if readErr != nil || string(content) != "{ this is not json" {
+		t.Fatalf("the backup does not hold the original bytes: %q %v", content, readErr)
+	}
+}
+
+// AppendAudit only queues a debounced write, so the loop's select used to be
+// able to take the closed channel before the dirty one and drop the last
+// change. Close must be a real final flush.
+func TestCloseFlushesUnsavedChanges(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir, "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	st.AppendAudit(&Audit{ID: "final", CreatedAt: time.Now(), KeyName: "probe"})
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := Open(dir, "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	if got := reopened.ListAudits(); len(got) != 1 || got[0].ID != "final" {
+		t.Fatalf("the last change before Close was lost: %+v", got)
+	}
+}
+
+// Sessions only leave the map through an explicit revoke or the sweeps, so the
+// map used to grow by one entry per login for the life of the process.
+func TestSessionMapSweepsExpiredEntries(t *testing.T) {
+	st := newTestStore(t)
+
+	st.mu.Lock()
+	for i := 0; i < 600; i++ {
+		st.sessions["expired-"+strconv.Itoa(i)] = time.Now().Add(-time.Hour)
+	}
+	st.sessions["still-live"] = time.Now().Add(time.Hour)
+	st.mu.Unlock()
+
+	token, _ := st.IssueSession()
+	if !st.ValidateSession(token) {
+		t.Fatal("the session issued after the sweep does not validate")
+	}
+
+	st.mu.Lock()
+	count := len(st.sessions)
+	_, expiredKept := st.sessions["expired-0"]
+	_, liveKept := st.sessions["still-live"]
+	st.mu.Unlock()
+	if expiredKept {
+		t.Fatal("expired entries survived the sweep")
+	}
+	if !liveKept {
+		t.Fatal("the sweep dropped a live session")
+	}
+	if count != 2 {
+		t.Fatalf("session map holds %d entries, want 2", count)
+	}
+
+	// ValidateSession drops an expired entry on sight.
+	st.mu.Lock()
+	st.sessions["stale"] = time.Now().Add(-time.Minute)
+	st.mu.Unlock()
+	if st.ValidateSession("stale") {
+		t.Fatal("an expired session validated")
+	}
+	st.mu.Lock()
+	_, staleKept := st.sessions["stale"]
+	st.mu.Unlock()
+	if staleKept {
+		t.Fatal("ValidateSession left the expired entry in the map")
+	}
+}
+
+// A state file written by a newer build may carry fields this build does not
+// know; loading it would drop them on the next write. Open must refuse and
+// leave the file exactly as it is.
+func TestOpenRejectsANewerSchemaVersion(t *testing.T) {
+	dir := t.TempDir()
+	raw, err := json.Marshal(State{
+		Version:  schemaVersion + 1,
+		Admin:    Admin{Username: "admin", Salt: "seeded", PasswordHash: "seeded"},
+		Settings: config.DefaultSettings(dir),
+	})
+	if err != nil {
+		t.Fatalf("marshal seed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, stateFile), raw, 0o600); err != nil {
+		t.Fatalf("seed %s: %v", stateFile, err)
+	}
+
+	st, err := Open(dir, "admin", "admin12345")
+	if err == nil {
+		_ = st.Close()
+		t.Fatal("Open accepted a state file written by a newer schema")
+	}
+	if !strings.Contains(err.Error(), "更新版本") {
+		t.Fatalf("the error does not explain the version refusal: %v", err)
+	}
+
+	// The refusal must not have rewritten the version on disk.
+	content, readErr := os.ReadFile(filepath.Join(dir, stateFile))
+	if readErr != nil {
+		t.Fatalf("read back: %v", readErr)
+	}
+	var got State
+	if err := json.Unmarshal(content, &got); err != nil {
+		t.Fatalf("parse back: %v", err)
+	}
+	if got.Version != schemaVersion+1 {
+		t.Fatalf("the version field was rewritten on disk: %d", got.Version)
+	}
+}
