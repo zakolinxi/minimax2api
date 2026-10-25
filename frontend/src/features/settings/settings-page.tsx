@@ -134,7 +134,12 @@ export function SettingsPage() {
   const [draft, setDraft] = useState<Draft | null>(null);
 
   useEffect(() => {
-    if (settingsQuery.data) setDraft(toDraft(settingsQuery.data));
+    const data = settingsQuery.data;
+    if (!data) return;
+    // Seed the draft once, before it exists. Re-seeding on every refetch would
+    // clobber edits the operator has not saved yet — and settings is refetched
+    // right after every save, so the overwrite would be immediate.
+    setDraft((current) => (current === null ? toDraft(data) : current));
   }, [settingsQuery.data]);
 
   const saveMutation = useMutation({

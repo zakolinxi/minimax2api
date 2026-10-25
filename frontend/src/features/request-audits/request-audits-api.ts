@@ -6,6 +6,13 @@ export type AuditDTO = {
   keyName: string;
   model: string;
   accountName: string;
+  /**
+   * Set on management-operation records the backend writes for admin actions.
+   * Those carry `action` (and optionally `detail`) while model and key stay
+   * empty, which is how the list tells them apart from /v1 traffic.
+   */
+  action?: string;
+  detail?: string;
   status: number;
   latencyMs: number;
   firstTokenMs: number;

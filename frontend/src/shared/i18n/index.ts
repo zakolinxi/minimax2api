@@ -45,6 +45,13 @@ const zhCN = {
     optional: "可选",
     notConfigured: "未配置",
     keepConfigured: "已配置，留空保持不变",
+    perPage: "{{count}} / 页",
+  },
+  periods: {
+    last24h: "最近 24 小时",
+    last7d: "最近 7 天",
+    last30d: "最近 30 天",
+    last90d: "最近 90 天",
   },
   shell: {
     appearance: "外观",
@@ -285,6 +292,10 @@ const zhCN = {
     expiredOn: "已过期 {{time}}",
     expiryUnknown: "到期时间未知",
     groupPlaceholder: "例如：默认分组",
+    selectedCount: "已选 {{count}}",
+    guestSuffix: "（游客）",
+    importFileReadFailed: "读取导入文件失败",
+    failCount: "失败 {{count}}",
   },
   clientKeys: {
     title: "客户端密钥",
@@ -662,6 +673,13 @@ const en: typeof zhCN = {
     optional: "Optional",
     notConfigured: "Not configured",
     keepConfigured: "Configured; leave blank to keep",
+    perPage: "{{count}} / page",
+  },
+  periods: {
+    last24h: "Last 24 hours",
+    last7d: "Last 7 days",
+    last30d: "Last 30 days",
+    last90d: "Last 90 days",
   },
   shell: {
     appearance: "Appearance",
@@ -757,7 +775,7 @@ const en: typeof zhCN = {
     browserLoginDescription: "Opens a managed browser window where you complete the MiniMax sign-in. Once it succeeds the account is added to the pool automatically — no token to paste.",
     browserLoginRegionHelp: "Pick the site to sign in to: the mainland site (agent.minimaxi.com) and the international site (agent.minimax.io) keep separate accounts, so match the one the account belongs to.",
     browserLoginProxy: "Proxy",
-    browserLoginProxyPlaceholder: "http://127.0.0.1:7890 或 socks5://127.0.0.1:1080",
+    browserLoginProxyPlaceholder: "http://127.0.0.1:7890 or socks5://127.0.0.1:1080",
     browserLoginProxyHelp: "Defaults to the project outbound proxy (Settings → Upstream → Proxy); override temporarily, or leave blank for direct connection.",
     browserLoginStart: "Start browser sign-in",
     browserLoginPending: "The sign-in window is open — finish signing in there…",
@@ -902,6 +920,10 @@ const en: typeof zhCN = {
     expiredOn: "Expired {{time}}",
     expiryUnknown: "Expiry unknown",
     groupPlaceholder: "e.g. default",
+    selectedCount: "{{count}} selected",
+    guestSuffix: " (guest)",
+    importFileReadFailed: "Failed to read the import file",
+    failCount: "{{count}} failed",
   },
   clientKeys: {
     title: "Client keys",
@@ -1266,7 +1288,16 @@ function readInitialLanguage(): string {
  * Chinese pronunciation and the browser would keep offering to translate from
  * Chinese. The attribute is not decorative — it is what those tools read.
  */
+function applyDocumentLanguage(language: string): void {
+  document.documentElement.lang = language === "en" ? "en" : "zh-CN";
+}
+
+// Set the attribute once for the language the module was initialised with —
+// the languageChanged event only fires on later switches.
+applyDocumentLanguage(readInitialLanguage());
+
 i18n.on("languageChanged", (language) => {
+  applyDocumentLanguage(language);
   try {
     window.localStorage.setItem("minimax2api:language", language);
   } catch {

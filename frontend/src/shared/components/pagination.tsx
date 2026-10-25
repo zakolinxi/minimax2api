@@ -35,7 +35,7 @@ export function Pagination({
             className="min-w-20"
             value={String(pageSize)}
             onChange={(value) => onPageSizeChange(Number(value))}
-            options={[20, 50, 100, 200].map((size) => ({ value: String(size), label: `${size} / 页` }))}
+            options={[20, 50, 100, 200].map((size) => ({ value: String(size), label: t("common.perPage", { count: size }) }))}
           />
         ) : null}
       </div>

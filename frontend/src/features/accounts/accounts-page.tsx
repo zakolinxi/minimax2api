@@ -185,6 +185,7 @@ export function AccountsPage() {
   const [importRegion, setImportRegion] = useState<AccountRegionInput>("auto");
   const [exportOpen, setExportOpen] = useState(false);
   const [exportLimit, setExportLimit] = useState(10000);
+  const [exportBusy, setExportBusy] = useState(false);
   const [cleanupOpen, setCleanupOpen] = useState(false);
   const [cleanupStates, setCleanupStates] = useState<string[]>(["invalid"]);
   const [deleteTarget, setDeleteTarget] = useState<AccountDTO | null>(null);
@@ -242,6 +243,29 @@ export function AccountsPage() {
     if (!browserOpen || !projectProxy) return;
     setBrowserProxy((current) => current || projectProxy);
   }, [browserOpen, projectProxy]);
+
+  // Selection is a shorthand for "the rows I am looking at": once a filter or
+  // the search narrows the list, ids picked under the previous view no longer
+  // describe what is on screen, and keeping them turns batch actions into
+  // accidents against accounts the operator forgot were selected.
+  useEffect(() => {
+    setSelected(new Set());
+  }, [statusFilter, kindFilter, groupFilter, subscriptionFilter, search]);
+
+  // A page can empty out from under the operator (bulk delete, cleanup, another
+  // admin sweeping). placeholderData keeps the stale rows visible, so without
+  // this the wrong page would never correct itself. Fall back to page 1 once —
+  // the guards keep the effect from re-firing on the same settled result.
+  useEffect(() => {
+    const data = accountsQuery.data;
+    if (!data) return;
+    const totalPages = Math.max(1, Math.ceil(data.total / pageSize));
+    if (data.items.length === 0 && data.total > 0 && page > 1) {
+      setPage(1);
+    } else if (page > totalPages) {
+      setPage(1);
+    }
+  }, [accountsQuery.data, page, pageSize]);
 
   const items = accountsQuery.data?.items ?? [];
   const summary: AccountSummary = accountsQuery.data?.summary ?? {
@@ -308,6 +332,35 @@ export function AccountsPage() {
     onError: (error) => toast.error(errorMessage(error)),
   });
 
+  // Enabling/disabling replays the same fields the edit form submits. The
+  // backend treats the identity fields (userId, uuid, baseURL, …) as "clear"
+  // when they are missing, so a payload shaped by EMPTY_EDITOR would wipe the
+  // custom upstream host and reset the region to auto on every toggle.
+  const toggleEnabledMutation = useMutation({
+    mutationFn: (account: AccountDTO) =>
+      updateAccount(account.id, {
+        name: account.name,
+        region: account.region,
+        group: account.group,
+        remark: account.remark,
+        priority: account.priority,
+        maxConcurrent: account.maxConcurrent,
+        enabled: !account.enabled,
+        userId: account.userId ?? "",
+        agentID: account.agentID ?? "",
+        deviceID: account.deviceID ?? "",
+        uuid: account.uuid ?? "",
+        baseURL: account.baseURL ?? "",
+        ...(account.screenWidth > 0 ? { screenWidth: account.screenWidth } : {}),
+        ...(account.screenHeight > 0 ? { screenHeight: account.screenHeight } : {}),
+      }),
+    onSuccess: () => {
+      toast.success(t("accounts.updated"));
+      invalidate();
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
   const importMutation = useMutation({
     mutationFn: () => importAccounts({ tokens: importText, region: importRegion }),
     onSuccess: (result) => {
@@ -322,10 +375,17 @@ export function AccountsPage() {
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => deleteAccount(id),
-    onSuccess: () => {
+    onSuccess: (_result, id) => {
       toast.success(t("accounts.deleted"));
       setDeleteTarget(null);
-      setSelected(new Set());
+      // Only the deleted account leaves the selection: a cross-page batch the
+      // operator built up must survive one single deletion.
+      setSelected((current) => {
+        if (!current.has(id)) return current;
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
       invalidate();
     },
     onError: (error) => toast.error(errorMessage(error)),
@@ -466,7 +526,7 @@ export function AccountsPage() {
     () => [
       { value: "", label: t("accounts.allTypes") },
       { value: "token", label: "Token" },
-      { value: "guest", label: t("accounts.providerMiniMax") + "（游客）" },
+      { value: "guest", label: t("accounts.providerMiniMax") + t("accounts.guestSuffix") },
     ],
     [t],
   );
@@ -535,6 +595,8 @@ export function AccountsPage() {
   }
 
   async function runExport(): Promise<void> {
+    if (exportBusy) return;
+    setExportBusy(true);
     try {
       const result = await exportAccounts(exportLimit);
       const blob = new Blob([JSON.stringify(result.accounts, null, 2)], { type: "application/json" });
@@ -548,6 +610,8 @@ export function AccountsPage() {
       setExportOpen(false);
     } catch (error) {
       toast.error(errorMessage(error));
+    } finally {
+      setExportBusy(false);
     }
   }
 
@@ -843,7 +907,7 @@ export function AccountsPage() {
               {selected.size > 0 ? (
                 <>
                   <Badge variant="secondary" className="h-6">
-                    已选 {selected.size}
+                    {t("accounts.selectedCount", { count: selected.size })}
                   </Badge>
                   <Button
                     variant="secondary"
@@ -960,20 +1024,7 @@ export function AccountsPage() {
               onSignin={(id) => signinOneMutation.mutate(id)}
               onCredit={(id) => creditMutation.mutate(id)}
               onClearCooldown={(id) => batchMutation.mutate({ action: "clearCooldown", ids: [id] })}
-              onToggleEnabled={(account) =>
-                updateMutation.mutate({
-                  ...EMPTY_EDITOR,
-                  open: false,
-                  mode: "edit",
-                  id: account.id,
-                  name: account.name,
-                  group: account.group,
-                  remark: account.remark,
-                  priority: account.priority,
-                  maxConcurrent: account.maxConcurrent,
-                  enabled: !account.enabled,
-                })
-              }
+              onToggleEnabled={(account) => toggleEnabledMutation.mutate(account)}
               onDelete={setDeleteTarget}
             />
           </TableSortProvider>
@@ -1211,7 +1262,10 @@ export function AccountsPage() {
                 onChange={(event) => {
                   const file = event.target.files?.[0];
                   if (!file) return;
-                  void file.text().then((text) => setImportText((current) => (current ? `${current}\n${text}` : text)));
+                  void file
+                    .text()
+                    .then((text) => setImportText((current) => (current ? `${current}\n${text}` : text)))
+                    .catch(() => toast.error(t("accounts.importFileReadFailed")));
                   event.target.value = "";
                 }}
               />
@@ -1291,14 +1345,19 @@ export function AccountsPage() {
               min={1}
               max={10000}
               value={exportLimit}
-              onChange={(event) => setExportLimit(Number(event.target.value))}
+              onChange={(event) => {
+                const parsed = Number(event.target.value);
+                // A cleared or malformed field would otherwise export a single
+                // record; fall back to the same default the dialog opens with.
+                setExportLimit(Number.isFinite(parsed) && parsed > 0 ? parsed : 10000);
+              }}
             />
           </div>
           <DialogFooter>
             <Button variant="secondary" size="sm" onClick={() => setExportOpen(false)}>
               {t("common.cancel")}
             </Button>
-            <Button size="sm" onClick={() => void runExport()}>
+            <Button size="sm" disabled={exportBusy} onClick={() => void runExport()}>
               {t("accounts.exportAuth")}
             </Button>
           </DialogFooter>
@@ -1366,7 +1425,12 @@ export function AccountsPage() {
               min={1}
               max={256}
               value={concurrencyValue}
-              onChange={(event) => setConcurrencyValue(Number(event.target.value))}
+              onChange={(event) =>
+                // Clamped here so the submit always carries the number the
+                // field shows — a cleared input must not fall back to the
+                // backend default.
+                setConcurrencyValue(Math.max(1, Math.trunc(Number(event.target.value) || 1)))
+              }
             />
           </div>
           <DialogFooter>

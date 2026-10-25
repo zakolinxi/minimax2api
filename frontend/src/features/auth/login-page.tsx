@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -12,6 +12,9 @@ export function LoginPage() {
   const { t } = useTranslation();
   const { login } = useAuth();
   const navigate = useNavigate();
+  // AuthBoundary records the page that triggered the sign-in here.
+  const location = useLocation();
+  const state = location.state as { from?: string } | null;
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -29,7 +32,7 @@ export function LoginPage() {
     setBusy(true);
     try {
       await login(username.trim(), password);
-      navigate("/dashboard", { replace: true });
+      navigate(state?.from ?? "/dashboard", { replace: true });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : t("errors.generic"));
     } finally {
