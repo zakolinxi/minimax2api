@@ -1977,11 +1977,14 @@ func upstreamStatus(err error) int {
 // clientIP reports where a request came from. X-Forwarded-For is only credited
 // when the operator said a trusted proxy sits in front (settings.Security.
 // TrustProxy); without that statement any caller could forge the IP its audit
-// rows carry by sending the header.
+// rows carry by sending the header. Even then the LAST entry is used, not the
+// first: an appending proxy adds the client it actually saw to the right-hand
+// end, so the first entry is whatever the caller chose to pre-send.
 func clientIP(r *http.Request, trustProxy bool) string {
 	if trustProxy {
 		if forwarded := r.Header.Get("x-forwarded-for"); forwarded != "" {
-			return strings.TrimSpace(strings.Split(forwarded, ",")[0])
+			parts := strings.Split(forwarded, ",")
+			return strings.TrimSpace(parts[len(parts)-1])
 		}
 	}
 	return remoteHost(r)
