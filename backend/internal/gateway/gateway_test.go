@@ -3,6 +3,7 @@ package gateway
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -166,6 +167,10 @@ func newHarness(t *testing.T, upstream http.HandlerFunc) *harness {
 	settings.Upstream.RequestTimeoutSec = 5
 	settings.Upstream.StreamIdleTimeoutSec = 3
 	settings.Media.AutoDownload = false
+	// The reference-image fixtures run on 127.0.0.1 httptest servers, which the
+	// gateway's SSRF guard refuses by default. The tests exercise the fetch
+	// path, not the guard — the guard has its own tests.
+	settings.Security.AllowPrivateFetch = true
 
 	server := httptest.NewServer(upstream)
 	t.Cleanup(server.Close)
@@ -2086,4 +2091,248 @@ func TestGenerationAcceptsAnInlineReference(t *testing.T) {
 	if entries, err := os.ReadDir(h.settings.Media.GeneratedDir); err == nil && len(entries) > 0 {
 		t.Errorf("the inline reference was written to the media directory: %v", entries)
 	}
+}
+
+// --- streaming failover -----------------------------------------------------
+
+// A streaming request whose first account fails before any delta reaches the
+// client must fail over like the non-streaming one does. The role frame used
+// to be written before the first attempt, committing the response and making
+// every streaming request unfailable.
+func TestChatCompletionsStreamsFailOverBeforeFirstDelta(t *testing.T) {
+	var attempts []string
+	h := newHarness(t, upstreamFunc(
+		func(token string) bool {
+			attempts = append(attempts, token)
+			return token != "token-bad"
+		},
+		func(string) string { return upstreamText("流式换号成功") },
+	))
+
+	h.addAccount(t, "broken", "token-bad", 1)
+	h.addAccount(t, "healthy", "token-good", 50)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-agent",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"stream":   true,
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !slices.Contains(attempts, "token-good") {
+		t.Fatalf("attempts = %v, want a retry on the healthy account", attempts)
+	}
+
+	sawContent := false
+	for _, line := range sseDataLines(t, rec) {
+		if line == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			t.Fatalf("chunk is not JSON: %v (%q)", err, line)
+		}
+		choices, _ := chunk["choices"].([]any)
+		entry, _ := choices[0].(map[string]any)
+		delta, _ := entry["delta"].(map[string]any)
+		if delta["content"] == "流式换号成功" {
+			sawContent = true
+		}
+	}
+	if !sawContent {
+		t.Fatal("the failed-over stream never delivered the answer")
+	}
+}
+
+// Every chunk of one completion shares one id and one created stamp, and the
+// role frame leads the stream.
+func TestChatCompletionsStreamSharesOneChunkID(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("回答")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-agent",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"stream":   true,
+	}, h.key)
+
+	lines := sseDataLines(t, rec)
+	id, created := "", ""
+	for index, line := range lines {
+		if line == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			t.Fatalf("chunk is not JSON: %v (%q)", err, line)
+		}
+		if id == "" {
+			id = chunk["id"].(string)
+			created = fmt.Sprintf("%v", int64(chunk["created"].(float64)))
+		}
+		if chunk["id"] != id {
+			t.Fatalf("chunk %d id = %v, want %q", index, chunk["id"], id)
+		}
+		if stamp := fmt.Sprintf("%v", int64(chunk["created"].(float64))); stamp != created {
+			t.Fatalf("chunk %d created = %v, want %q", index, chunk["created"], created)
+		}
+		choices, _ := chunk["choices"].([]any)
+		entry, _ := choices[0].(map[string]any)
+		delta, _ := entry["delta"].(map[string]any)
+		if index == 0 {
+			if _, ok := delta["role"]; !ok {
+				t.Fatalf("first chunk is not the role frame: %v", delta)
+			}
+		}
+	}
+}
+
+// stream_options.include_usage appends the usage chunk with an empty choices
+// array right before [DONE]; a request that did not ask gets none.
+func TestChatCompletionsStreamUsageChunk(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("回答")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model":          "minimax-agent",
+		"messages":       []any{map[string]any{"role": "user", "content": "hi"}},
+		"stream":         true,
+		"stream_options": map[string]any{"include_usage": true},
+	}, h.key)
+
+	lines := sseDataLines(t, rec)
+	if len(lines) < 2 || lines[len(lines)-1] != "[DONE]" {
+		t.Fatalf("stream tail = %v", lines[max(0, len(lines)-3):])
+	}
+	var usage map[string]any
+	for _, line := range lines {
+		if line == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			continue
+		}
+		if raw, ok := chunk["usage"].(map[string]any); ok {
+			choices, _ := chunk["choices"].([]any)
+			if len(choices) != 0 {
+				t.Fatalf("usage chunk carries choices: %v", chunk)
+			}
+			usage = raw
+		}
+	}
+	if usage == nil {
+		t.Fatal("no usage chunk with include_usage")
+	}
+	if usage["total_tokens"] == float64(0) {
+		t.Fatalf("usage = %v, want non-zero totals", usage)
+	}
+
+	plain := h.chat(t, map[string]any{
+		"model":    "minimax-agent",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"stream":   true,
+	}, h.key)
+	for _, line := range sseDataLines(t, plain) {
+		if line == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			continue
+		}
+		if _, ok := chunk["usage"]; ok {
+			t.Fatalf("usage chunk without include_usage: %v", chunk)
+		}
+	}
+}
+
+// --- tool history replay ----------------------------------------------------
+
+// The OpenAI surface must replay assistant tool_calls and tool results into
+// the prompt. Without the replay, the second turn of any tool loop reaches the
+// model as an empty assistant line plus user prose.
+func TestBuildPromptReplaysToolHistory(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("ok")))
+
+	raw := `[
+		{"role": "user", "content": "查一下天气"},
+		{"role": "assistant", "content": "", "tool_calls": [
+			{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"上海\"}"}}
+		]},
+		{"role": "tool", "tool_call_id": "call_1", "content": "晴 28 度"},
+		{"role": "assistant", "content": "上海今天晴"}
+	]`
+	var messages []chatMessage
+	if err := json.Unmarshal([]byte(raw), &messages); err != nil {
+		t.Fatalf("decode conversation: %v", err)
+	}
+
+	prompt, _, _, err := h.gateway.buildPrompt(context.Background(), messages, -1)
+	if err != nil {
+		t.Fatalf("buildPrompt: %v", err)
+	}
+	for _, want := range []string{
+		"[调用了工具 get_weather，参数 " + `{"city":"上海"}` + "]",
+		"[工具 call_1 返回] 晴 28 度",
+		"助手：上海今天晴",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt lacks %q:\n%s", want, prompt)
+		}
+	}
+}
+
+// A reference cap must be applied before the pictures are fetched, so the
+// pictures that would be dropped are never downloaded at all.
+func TestBuildPromptSkipsDownloadsBeyondTheReferenceCap(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("ok")))
+	model, ok := h.store.ModelByID("minimax-agent")
+	if !ok {
+		t.Fatal("no minimax-agent in the catalogue")
+	}
+	model.MaxReferences = 1
+
+	hits := 0
+	fetches := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("content-type", "image/png")
+		_, _ = w.Write(tinyPNGBytes(t))
+	}))
+	defer fetches.Close()
+
+	content := []any{
+		map[string]any{"type": "text", "text": "看看"},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": fetches.URL + "/1.png"}},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": fetches.URL + "/2.png"}},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": fetches.URL + "/3.png"}},
+	}
+	var messages []chatMessage
+	raw, _ := json.Marshal([]any{map[string]any{"role": "user", "content": content}})
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		t.Fatalf("decode messages: %v", err)
+	}
+
+	keep, _ := referenceLimit(model, countImageReferences(messages))
+	_, images, _, err := h.gateway.buildPrompt(context.Background(), messages, keep)
+	if err != nil {
+		t.Fatalf("buildPrompt: %v", err)
+	}
+	if len(images) != 1 {
+		t.Fatalf("images = %d, want 1", len(images))
+	}
+	if hits != 1 {
+		t.Fatalf("downloads = %d, want 1 — the cap must be applied before fetching", hits)
+	}
+}
+
+func tinyPNGBytes(t *testing.T) []byte {
+	t.Helper()
+	pixels, err := base64.StdEncoding.DecodeString(tinyPNG)
+	if err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	return pixels
 }

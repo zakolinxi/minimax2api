@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"minimax2api/internal/config"
 	"minimax2api/internal/minimax"
@@ -93,11 +95,51 @@ type chatRequest struct {
 	// nearest size the model offers rather than rejected; zero means "no
 	// preference" and sends nothing.
 	ContextWindow int `json:"context_window"`
+	// StreamOptions mirrors OpenAI's field of the same name; only include_usage
+	// has an effect. Without it a stream never reports usage, which left every
+	// streaming client without the token counts the non-streaming response has.
+	StreamOptions *streamOptions `json:"stream_options"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+// streamUsage renders the usage chunk for a stream that asked for it. A nil
+// return means the caller said nothing and no usage chunk goes out.
+func streamUsage(request chatRequest, promptTokens, completionTokens int) map[string]any {
+	if request.StreamOptions == nil || !request.StreamOptions.IncludeUsage {
+		return nil
+	}
+	return map[string]any{
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
+		"total_tokens":      promptTokens + completionTokens,
+	}
 }
 
 type chatMessage struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
+	// ToolCalls rides on assistant messages and ToolCallID on tool messages.
+	// The gateway emulates tools over prose, so a follow-up turn only makes
+	// sense to the model if the calls it made and the results it got are
+	// flattened back into the prompt it reads. Without these fields the second
+	// turn of any tool loop reaches the model as "assistant said nothing" plus
+	// "user said: <result>" — see buildPrompt.
+	ToolCalls  []toolCallRef `json:"tool_calls,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
+}
+
+// toolCallRef is the one entry of an OpenAI `tool_calls` array, as a client
+// echoes it back in the conversation history.
+type toolCallRef struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 type contentPart struct {
@@ -169,7 +211,14 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt, images, files, err := g.buildPrompt(r.Context(), request.Messages)
+	// The same cap the video endpoint enforces, applied where the pictures
+	// arrive as message content rather than as request fields. A chat turn has
+	// nowhere to report a trim — its answer is the agent's own prose — so this
+	// one happens silently; VideoGenerations reports the identical trim. The
+	// cap rides into buildPrompt so the pictures beyond it are never fetched
+	// at all, not downloaded and then dropped.
+	keep, _ := referenceLimit(model, countImageReferences(request.Messages))
+	prompt, images, files, err := g.buildPrompt(r.Context(), request.Messages, keep)
 	if err != nil {
 		writeError(out, http.StatusBadRequest, err.Error())
 		return
@@ -178,9 +227,6 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// arrive as message content rather than as request fields. A chat turn has
 	// nowhere to report a trim — its answer is the agent's own prose — so this
 	// one happens silently; VideoGenerations reports the identical trim.
-	if keep, _ := referenceLimit(model, len(images)); keep < len(images) {
-		images = images[:keep]
-	}
 	if prompt == "" && len(images) == 0 && len(files) == 0 {
 		writeError(out, http.StatusBadRequest, "messages must contain text, image or file content")
 		return
@@ -209,31 +255,28 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	splitter := newToolSplitter(toolsEnabled)
+
+	// Every chunk of one completion shares one id and one created stamp — that
+	// is the OpenAI stream contract, and clients that aggregate by id split a
+	// mixed-id stream into several completions.
+	stream := newSSEStream(out, model)
 	var onDelta, onThinking func(string)
-
-	var chunkMu sync.Mutex
-	writeChunk := func(delta map[string]any, finish any) {
-		chunkMu.Lock()
-		defer chunkMu.Unlock()
-		ensureStreamHeaders(out)
-		writeChunkRaw(out, model, delta, finish)
-		out.Flush()
-	}
-
 	if request.Stream {
 		onDelta = func(text string) {
 			if safe := splitter.push(text); safe != "" {
-				writeChunk(map[string]any{"content": safe}, nil)
+				stream.delta(map[string]any{"content": safe}, nil)
 			}
 		}
 		onThinking = func(text string) {
-			writeChunk(map[string]any{"reasoning_content": text}, nil)
+			stream.delta(map[string]any{"reasoning_content": text}, nil)
 		}
-		// The role frame opens the message and goes out before the upstream is
-		// called. That also means a streaming request has committed by the time
-		// its first attempt is made: a retry would append a second answer to a
-		// message the caller has already begun reading.
-		writeChunk(map[string]any{"role": "assistant", "content": ""}, nil)
+		// The role frame is deferred to the first real delta rather than written
+		// up front. Writing it eagerly committed the response before the first
+		// attempt reached the upstream, which made every streaming request
+		// unfailable: a dead account, a timeout or a 5xx could never be retried
+		// on another account, because the caller had already begun reading an
+		// answer. Nothing is on the wire until a delta exists, so the committed
+		// check below now means what it says.
 	}
 
 	turn, lastErr := g.runTurn(r.Context(), turnRequest{
@@ -285,21 +328,21 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			// it, so only it knows what is still being held back.
 			tail, held := splitter.finish()
 			if tail != "" {
-				writeChunk(map[string]any{"content": tail}, nil)
+				stream.delta(map[string]any{"content": tail}, nil)
 			}
 			if held != nil {
 				calls = held
 			}
 		} else {
 			if result.Thinking != "" {
-				writeChunk(map[string]any{"reasoning_content": result.Thinking}, nil)
+				stream.delta(map[string]any{"reasoning_content": result.Thinking}, nil)
 			}
 			if text != "" {
-				writeChunk(map[string]any{"content": text}, nil)
+				stream.delta(map[string]any{"content": text}, nil)
 			}
 		}
 		mediaURLs := g.persistMediaList(result.Media, prompt, model.ID, accountName)
-		g.finishStream(out, model, mediaURLs, calls)
+		stream.finish(mediaURLs, calls, streamUsage(request, promptTokens, completionTokens))
 		g.recordAudit(r, key, model, accountName, started, http.StatusOK, turn.FirstToken, promptTokens, completionTokens, true, turn.Retries, string(body), result.Text, "")
 		return
 	}
@@ -447,6 +490,12 @@ func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, er
 			Timeout:      timeoutFor(settings, req.Model),
 			IdleTimeout:  settings.StreamIdleTimeout(),
 		}
+		// A video model reached through the chat endpoint carries the same
+		// intent marker the dedicated video endpoint sends, so the upstream
+		// sees one fingerprint for one capability however it was reached.
+		if req.Model.Type == store.ModelTypeVideo {
+			opts.ClientIntent = minimax.VideoClientIntent
+		}
 		if req.OnDelta != nil {
 			opts.OnDelta = func(text string) {
 				markFirst()
@@ -504,24 +553,97 @@ func ensureStreamHeaders(out *respWriter) {
 	out.WriteHeader(http.StatusOK)
 }
 
-// finishStream terminates the SSE response with whatever is left: media URLs
-// and any tool calls the model asked for.
+// sseStream owns one OpenAI-compatible streaming response: the id and created
+// stamp every chunk of a completion must share, the deferred role frame, and
+// the terminal frames.
 //
-// Text that never streamed is written by the caller, not here — it needs the
-// same call-block handling as the streamed path, and splitting that logic in
-// two is how the two paths drift apart.
-func (g *Gateway) finishStream(out *respWriter, model *store.ModelConfig, mediaURLs []string, calls []toolCall) {
-	ensureStreamHeaders(out)
+// The role frame is emitted lazily — ahead of the first chunk that actually
+// needs to go out — so a request whose first attempt fails before producing a
+// delta has nothing on the wire yet and can still fail over to another account.
+type sseStream struct {
+	out      *respWriter
+	model    *store.ModelConfig
+	id       string
+	created  int64
+	mu       sync.Mutex
+	roleSent bool
+}
+
+func newSSEStream(out *respWriter, model *store.ModelConfig) *sseStream {
+	return &sseStream{
+		out:     out,
+		model:   model,
+		id:      "chatcmpl-" + randomID(12),
+		created: time.Now().Unix(),
+	}
+}
+
+// delta writes one chunk, emitting the role frame ahead of the first one.
+func (s *sseStream) delta(delta map[string]any, finish any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureRoleLocked()
+	s.writeLocked(delta, finish)
+	s.out.Flush()
+}
+
+// finish terminates the stream: the role frame if nothing ever streamed, then
+// media URLs and any tool calls the model asked for, then the usage chunk the
+// request asked for (a nil usage emits none), then [DONE].
+func (s *sseStream) finish(mediaURLs []string, calls []toolCall, usage map[string]any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureRoleLocked()
 	if len(mediaURLs) > 0 {
-		writeChunkRaw(out, model, map[string]any{"media": mediaURLs}, nil)
+		s.writeLocked(map[string]any{"media": mediaURLs}, nil)
 	}
 	if len(calls) > 0 {
-		writeChunkRaw(out, model, map[string]any{"tool_calls": streamedToolCallDeltas(calls)}, "tool_calls")
+		s.writeLocked(map[string]any{"tool_calls": streamedToolCallDeltas(calls)}, "tool_calls")
 	} else {
-		writeChunkRaw(out, model, map[string]any{}, "stop")
+		s.writeLocked(map[string]any{}, "stop")
 	}
-	_, _ = io.WriteString(out, "data: [DONE]\n\n")
-	out.Flush()
+	if usage != nil {
+		s.usageChunkLocked(usage)
+	}
+	_, _ = io.WriteString(s.out, "data: [DONE]\n\n")
+	s.out.Flush()
+}
+
+func (s *sseStream) ensureRoleLocked() {
+	if s.roleSent {
+		return
+	}
+	s.roleSent = true
+	s.writeLocked(map[string]any{"role": "assistant", "content": ""}, nil)
+}
+
+func (s *sseStream) writeLocked(delta map[string]any, finish any) {
+	ensureStreamHeaders(s.out)
+	payload := map[string]any{
+		"id":      s.id,
+		"object":  "chat.completion.chunk",
+		"created": s.created,
+		"model":   s.model.ID,
+		"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
+	}
+	raw, _ := json.Marshal(payload)
+	_, _ = fmt.Fprintf(s.out, "data: %s\n\n", raw)
+}
+
+// usageChunkLocked renders the terminal usage chunk: an empty choices array
+// carrying the token counts, per OpenAI's include_usage shape.
+func (s *sseStream) usageChunkLocked(usage map[string]any) {
+	ensureStreamHeaders(s.out)
+	payload := map[string]any{
+		"id":      s.id,
+		"object":  "chat.completion.chunk",
+		"created": s.created,
+		"model":   s.model.ID,
+		"choices": []any{},
+		"usage":   usage,
+	}
+	raw, _ := json.Marshal(payload)
+	_, _ = fmt.Fprintf(s.out, "data: %s\n\n", raw)
 }
 
 // streamedToolCallDeltas renders calls in the incremental shape OpenAI streams.
@@ -553,16 +675,19 @@ func writeChunkRaw(out *respWriter, model *store.ModelConfig, delta map[string]a
 	}
 	raw, _ := json.Marshal(payload)
 	_, _ = fmt.Fprintf(out, "data: %s\n\n", raw)
-}
-
-// ------------------------------------------------------------ prompt build
+}// ------------------------------------------------------------ prompt build
 
 // buildPrompt flattens the conversation into the single content string the
 // agent expects, and collects the attachments it should carry: images by URL,
 // files as pending uploads (bytes are resolved from /v1/files or the request
 // body and pushed to the object store by the turn itself, with the sending
 // account's credential).
-func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage) (string, []minimax.UploadedImage, []minimax.PendingAttachment, error) {
+//
+// imageCap bounds how many reference pictures get resolved. It is applied here
+// rather than by the caller afterwards, because resolving means downloading:
+// a caller that sent ten pictures at a cap of two must not pay for eight
+// fetches that were going to be dropped.
+func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage, imageCap int) (string, []minimax.UploadedImage, []minimax.PendingAttachment, error) {
 	if len(messages) == 0 {
 		return "", nil, nil, nil
 	}
@@ -577,6 +702,17 @@ func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage) (stri
 			builder.WriteString("[系统指令] " + text + "\n\n")
 		case "assistant":
 			builder.WriteString("助手：" + text + "\n")
+			// Replay the tool calls the assistant made, in the same shape the
+			// Anthropic front end uses. A parallel burst of calls is
+			// indistinguishable to the model otherwise: every result would read
+			// as prose from the user, with nothing tying it to its arguments.
+			for _, call := range message.ToolCalls {
+				builder.WriteString(fmt.Sprintf("[调用了工具 %s，参数 %s]\n", call.Function.Name, call.Function.Arguments))
+			}
+		case "tool":
+			// The result of a call the assistant made, labelled with the id the
+			// caller kept from the tool_calls payload.
+			builder.WriteString(fmt.Sprintf("[工具 %s 返回] %s\n", message.ToolCallID, text))
 		default:
 			if len(messages) > 1 {
 				builder.WriteString("用户：" + text + "\n")
@@ -586,7 +722,10 @@ func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage) (stri
 		}
 
 		for _, raw := range urls {
-			image, err := g.resolveImage(raw)
+			if imageCap >= 0 && len(images) >= imageCap {
+				break
+			}
+			image, err := g.resolveImage(ctx, raw)
 			if err != nil {
 				return "", nil, nil, err
 			}
@@ -602,6 +741,17 @@ func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage) (stri
 	}
 
 	return strings.TrimSpace(builder.String()), images, files, nil
+}
+
+// countImageReferences reports how many reference pictures a conversation
+// carries, so the cap can be computed before anything is downloaded.
+func countImageReferences(messages []chatMessage) int {
+	total := 0
+	for _, message := range messages {
+		_, urls, _ := parseContent(message.Content)
+		total += len(urls)
+	}
+	return total
 }
 
 // resolveImage turns an OpenAI image reference into something the agent can
@@ -622,7 +772,7 @@ func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage) (stri
 // that means: the gateway is now the one making the request, so a client key
 // can point it at anything the gateway can reach. Treat the key list with the
 // same care as the account list.
-func (g *Gateway) resolveImage(raw string) (minimax.UploadedImage, error) {
+func (g *Gateway) resolveImage(ctx context.Context, raw string) (minimax.UploadedImage, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return minimax.UploadedImage{}, errors.New("reference image is empty")
@@ -657,7 +807,7 @@ func (g *Gateway) resolveImage(raw string) (minimax.UploadedImage, error) {
 			"reference image must be an http(s) URL or a data: URI — the gateway fetches it and uploads it to the agent, so a bare base64 payload or a local path cannot work (got %.60q)",
 			raw)
 	}
-	return g.downloadImage(raw)
+	return g.downloadImage(ctx, raw)
 }
 
 // referenceImageTimeout bounds one fetch. It is deliberately not the request
@@ -673,9 +823,18 @@ const referenceImageTimeout = 60 * time.Second
 const maxReferenceImageBytes = 32 << 20
 
 // downloadImage fetches a reference picture and returns its bytes.
-func (g *Gateway) downloadImage(raw string) (minimax.UploadedImage, error) {
+//
+// The fetch targets a caller-supplied URL, so it is deliberately paranoid:
+// addresses that resolve to loopback, private or link-local space are refused
+// at dial time (see minimax.DownloadClient — the check runs on the resolved
+// address, so a DNS name that rebinding-resolves to an intranet host is caught
+// too), and a transport failure is reported generically. A dial error names
+// the address that was tried and whether the port answered — exactly the
+// feedback an intranet sweep wants — so the detail goes to the server log and
+// the caller gets the same answer for every unreachable target.
+func (g *Gateway) downloadImage(ctx context.Context, raw string) (minimax.UploadedImage, error) {
 	settings := g.settings()
-	ctx, cancel := context.WithTimeout(context.Background(), referenceImageTimeout)
+	ctx, cancel := context.WithTimeout(ctx, referenceImageTimeout)
 	defer cancel()
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
@@ -687,9 +846,11 @@ func (g *Gateway) downloadImage(raw string) (minimax.UploadedImage, error) {
 	// gateway fetches.
 	response, err := minimax.DownloadClient(settings).Do(request)
 	if err != nil {
-		// The URL carries no credential of ours, so the transport error goes
-		// through as it is — there is nothing in it to redact.
-		return minimax.UploadedImage{}, fmt.Errorf("fetch reference image: %w", err)
+		log.Printf("reference image fetch failed for %s: %v", raw, err)
+		if errors.Is(err, minimax.ErrPrivateAddress) {
+			return minimax.UploadedImage{}, fmt.Errorf("fetch reference image: that address is not allowed")
+		}
+		return minimax.UploadedImage{}, fmt.Errorf("fetch reference image: the image server could not be reached")
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -766,13 +927,13 @@ func (r referenceRequest) collect() []string {
 // It is the only path from a request field to a reference picture, so that the
 // two generation endpoints cannot drift apart on what they accept or on how
 // many they keep.
-func (g *Gateway) resolveReferences(model *store.ModelConfig, request referenceRequest) ([]minimax.UploadedImage, []minimax.Adjustment, error) {
+func (g *Gateway) resolveReferences(ctx context.Context, model *store.ModelConfig, request referenceRequest) ([]minimax.UploadedImage, []minimax.Adjustment, error) {
 	raw := request.collect()
 	keep, adjustments := referenceLimit(model, len(raw))
 	raw = raw[:keep]
 	images := make([]minimax.UploadedImage, 0, len(raw))
 	for _, reference := range raw {
-		image, err := g.resolveImage(reference)
+		image, err := g.resolveImage(ctx, reference)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -970,6 +1131,13 @@ func (g *Gateway) runImageTurn(
 	)
 
 	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
+		// A caller that hung up mid-turn must not cost another account: without
+		// this check every remaining attempt would lease, fail on the cancelled
+		// context and release again, spending accounts to learn nothing.
+		if ctx.Err() != nil {
+			lastErr = ctx.Err()
+			break
+		}
 		lease, err := g.pool.Acquire(ctx, "")
 		if err != nil {
 			lastErr = err
@@ -1042,11 +1210,10 @@ func (g *Gateway) chatImage(
 	if request.Stream {
 		// Nothing streamed as it arrived — an image turn is one blocking call —
 		// so the whole message goes out as a single chunk before the stream is
-		// closed.
-		ensureStreamHeaders(out)
-		writeChunkRaw(out, model, map[string]any{"content": content}, nil)
-		out.Flush()
-		g.finishStream(out, model, nil, nil)
+		// closed. The role frame rides along via the stream's lazy emit.
+		stream := newSSEStream(out, model)
+		stream.delta(map[string]any{"content": content}, nil)
+		stream.finish(nil, nil, nil)
 		g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, promptTokens, 0, true, 0, string(body), content, "")
 		return
 	}
@@ -1192,7 +1359,7 @@ func (g *Gateway) ImageGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	images, adjustments, err := g.resolveReferences(model, request.referenceRequest)
+	images, adjustments, err := g.resolveReferences(r.Context(), model, request.referenceRequest)
 	if err != nil {
 		writeError(out, http.StatusBadRequest, err.Error())
 		return
@@ -1206,11 +1373,17 @@ func (g *Gateway) ImageGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	urls := g.persistMediaList(result.Media, request.Prompt, model.ID, accountName)
+	// stored keeps the raw /media/ paths (b64 reads the local file from them);
+	// urls is the same list absolutized, because a bare path is worthless to a
+	// client that is not this machine. The chat endpoint already answered with
+	// absolute URLs; the dedicated endpoint answering with paths was an
+	// inconsistency a non-OpenAI-shaped client could trip over.
+	stored := g.persistMediaList(result.Media, request.Prompt, model.ID, accountName)
+	urls := g.absoluteMediaURLs(r, stored)
 	items := make([]any, 0, len(urls))
 	for index, url := range urls {
-		if request.ResponseFormat == "b64_json" {
-			path := filepath.Join(settings.Media.GeneratedDir, filepath.Base(url))
+		if request.ResponseFormat == "b64_json" && index < len(stored) && strings.HasPrefix(stored[index], "/media/") {
+			path := filepath.Join(settings.Media.GeneratedDir, filepath.Base(stored[index]))
 			if data, err := os.ReadFile(path); err == nil {
 				items = append(items, map[string]any{"b64_json": base64.StdEncoding.EncodeToString(data)})
 				continue
@@ -1333,7 +1506,7 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 	// Reference frames ride along as ordinary attachments; the plugin reads them
 	// from the turn rather than from the options block, which only carries the
 	// four generation parameters.
-	images, referenceAdjustments, err := g.resolveReferences(model, request.referenceRequest)
+	images, referenceAdjustments, err := g.resolveReferences(r.Context(), model, request.referenceRequest)
 	if err != nil {
 		writeError(out, http.StatusBadRequest, err.Error())
 		return
@@ -1354,6 +1527,12 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 	)
 
 	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
+		// Same rule as runImageTurn: a caller that hung up must not spend the
+		// remaining attempts leasing one account after another.
+		if r.Context().Err() != nil {
+			lastErr = r.Context().Err()
+			break
+		}
 		lease, err := g.acquireAccount(r.Context(), "", model)
 		if err != nil {
 			lastErr = err
@@ -1398,7 +1577,7 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	urls := g.persistMediaList(result.Media, request.Prompt, model.ID, accountName)
+	urls := g.absoluteMediaURLs(r, g.persistMediaList(result.Media, request.Prompt, model.ID, accountName))
 	items := make([]any, 0, len(urls))
 	for index, url := range urls {
 		source := ""
@@ -1579,18 +1758,40 @@ func mergeMedia(primary, extra []minimax.MediaRef) []minimax.MediaRef {
 	return out
 }
 
+// persistMediaList stores every produced item and returns the URL to serve it
+// from. Downloads run three at a time rather than one after another: a turn
+// that produced a video plus its cover used to hold the stream's final chunk
+// hostage for up to three minutes per item while the downloads finished one by
+// one. Results keep the input order regardless of who finished first.
 func (g *Gateway) persistMediaList(media []minimax.MediaRef, prompt, model, account string) []string {
-	urls := make([]string, 0, len(media))
-	for _, item := range media {
-		urls = append(urls, g.persistMedia(item, prompt, model, account))
+	urls := make([]string, len(media))
+	if len(media) == 0 {
+		return urls
 	}
+	const maxParallel = 3
+	slots := make(chan struct{}, min(maxParallel, len(media)))
+	var wg sync.WaitGroup
+	for index, item := range media {
+		wg.Add(1)
+		go func(index int, item minimax.MediaRef) {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			urls[index] = g.persistMedia(item, prompt, model, account)
+		}(index, item)
+	}
+	wg.Wait()
 	return urls
 }
 
 func (g *Gateway) persistMedia(media minimax.MediaRef, prompt, model, account string) string {
 	settings := g.settings()
 	item := &store.MediaItem{
-		ID:          "media_" + randomID(8),
+		// 128 bits of id. These names are the only thing between a generated
+		// picture and an anonymous GET /media/<name>: they are unauthenticated
+		// by design (the console renders them with plain <img> tags), so the
+		// id has to be unguessable rather than merely random-looking.
+		ID:          "media_" + randomID(32),
 		Kind:        media.Kind,
 		SourceURL:   media.URL,
 		URL:         media.URL,
@@ -1668,7 +1869,7 @@ func (g *Gateway) recordAudit(
 		CompletionTokens: completionTokens,
 		Stream:           stream,
 		Retries:          retries,
-		IP:               clientIP(r),
+		IP:               clientIP(r, settings.Security.TrustProxy),
 		UserAgent:        r.Header.Get("user-agent"),
 		Error:            errText,
 	}
@@ -1683,7 +1884,13 @@ func clampBody(value string, limit int) string {
 	if limit <= 0 || len(value) <= limit {
 		return value
 	}
-	return value[:limit] + "…"
+	// Cut on a rune boundary: a body truncated mid-character would push
+	// invalid UTF-8 into the audit store and from there into the console.
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + "…"
 }
 
 // ------------------------------------------------------------------ helpers
@@ -1737,12 +1944,15 @@ func displayName(account *store.Account) string {
 	return store.MaskToken(account.Token)
 }
 
+// isPoolExhausted reports whether the failure means "no account to try", which
+// ends the retry loop: waiting out the remaining attempts cannot conjure one.
+// The sentinels are matched by identity, not by message text — an upstream body
+// that happens to contain the phrase must not end a retry loop that could
+// still succeed.
 func isPoolExhausted(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := err.Error()
-	return strings.Contains(message, "no account available") || strings.Contains(message, "all accounts are busy")
+	return errors.Is(err, pool.ErrNoAccount) ||
+		errors.Is(err, pool.ErrNoCapacity) ||
+		errors.Is(err, errSubscriptionRequired)
 }
 
 // upstreamStatus maps a turn failure onto the status the caller should see.
@@ -1764,10 +1974,20 @@ func upstreamStatus(err error) int {
 	return http.StatusBadGateway
 }
 
-func clientIP(r *http.Request) string {
-	if forwarded := r.Header.Get("x-forwarded-for"); forwarded != "" {
-		return strings.TrimSpace(strings.Split(forwarded, ",")[0])
+// clientIP reports where a request came from. X-Forwarded-For is only credited
+// when the operator said a trusted proxy sits in front (settings.Security.
+// TrustProxy); without that statement any caller could forge the IP its audit
+// rows carry by sending the header.
+func clientIP(r *http.Request, trustProxy bool) string {
+	if trustProxy {
+		if forwarded := r.Header.Get("x-forwarded-for"); forwarded != "" {
+			return strings.TrimSpace(strings.Split(forwarded, ",")[0])
+		}
 	}
+	return remoteHost(r)
+}
+
+func remoteHost(r *http.Request) string {
 	host := r.RemoteAddr
 	if index := strings.LastIndex(host, ":"); index >= 0 {
 		host = host[:index]
@@ -1777,8 +1997,12 @@ func clientIP(r *http.Request) string {
 
 func randomID(length int) string {
 	buf := make([]byte, (length+1)/2)
+	// Uniqueness of these ids is load-bearing — media filenames and audit ids
+	// are derived from them — and a timestamp fallback collapses to
+	// microseconds of entropy under concurrent callers. A broken CSPRNG is a
+	// process-wide fault: stop rather than mint colliding ids.
 	if _, err := rand.Read(buf); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+		panic("crypto/rand failed: " + err.Error())
 	}
 	return hex.EncodeToString(buf)[:length]
 }

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -92,7 +93,7 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt, images, files, err := g.anthropicPrompt(request.System, request.Messages)
+	prompt, images, files, err := g.anthropicPrompt(r.Context(), request.System, request.Messages)
 	if err != nil {
 		writeAnthropicError(out, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -135,7 +136,11 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		onThinking = func(text string) {
 			stream.thinking(text)
 		}
-		stream.start()
+		// message_start is deferred to the first real event, same rule as the
+		// OpenAI front end's role frame: emitting it up front committed the
+		// response before the first attempt reached the upstream and made every
+		// streaming request unfailable. Nothing is on the wire until a delta
+		// exists, so the committed check below now means what it says.
 	}
 
 	turn, lastErr := g.runTurn(r.Context(), turnRequest{
@@ -235,7 +240,14 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	raw, _ := json.Marshal(response)
+	raw, err := json.Marshal(response)
+	if err != nil {
+		// Unreachable now that rawJSONObject guarantees valid embedded JSON, but
+		// a marshal failure used to produce a 200 with an empty body — the one
+		// outcome that gives a client nothing to debug. Keep the guard.
+		writeAnthropicError(out, http.StatusInternalServerError, "api_error", "failed to encode response")
+		return
+	}
 	g.recordAudit(r, key, model, turn.AccountName, started, http.StatusOK, turn.FirstToken, promptTokens, completionTokens, false, turn.Retries, string(body), string(raw), "")
 	out.Header().Set("content-type", "application/json")
 	out.WriteHeader(http.StatusOK)
@@ -283,7 +295,7 @@ func anthropicToolSpecs(tools []anthropicTool) []toolSpec {
 // anthropicPrompt flattens an Anthropic conversation the way buildPrompt
 // flattens an OpenAI one, so both front ends reach the upstream with the same
 // text for the same conversation.
-func (g *Gateway) anthropicPrompt(system json.RawMessage, messages []anthropicMessage) (string, []minimax.UploadedImage, []minimax.PendingAttachment, error) {
+func (g *Gateway) anthropicPrompt(ctx context.Context, system json.RawMessage, messages []anthropicMessage) (string, []minimax.UploadedImage, []minimax.PendingAttachment, error) {
 	var builder strings.Builder
 	var images []minimax.UploadedImage
 	var files []minimax.PendingAttachment
@@ -305,7 +317,7 @@ func (g *Gateway) anthropicPrompt(system json.RawMessage, messages []anthropicMe
 			}
 		}
 		for _, raw := range urls {
-			image, err := g.resolveImage(raw)
+			image, err := g.resolveImage(ctx, raw)
 			if err != nil {
 				return "", nil, nil, err
 			}
@@ -405,6 +417,13 @@ func anthropicBlocks(raw json.RawMessage) (string, []string, []contentPart) {
 			// Anthropic-shaped turn, and a fetch-the-world proxy is not this
 			// gateway's job.
 			if block.Source.Type == "base64" && strings.TrimSpace(block.Source.Data) != "" {
+				// PDF is the only document type the Anthropic surface defines, so
+				// an absent media_type means PDF rather than an invalid
+				// "data:;base64" URL the upstream would have to guess at.
+				mediaType := strings.TrimSpace(block.Source.MediaType)
+				if mediaType == "" {
+					mediaType = "application/pdf"
+				}
 				name := strings.TrimSpace(block.Title)
 				if name == "" {
 					name = "document"
@@ -417,7 +436,7 @@ func anthropicBlocks(raw json.RawMessage) (string, []string, []contentPart) {
 						FileData string `json:"file_data"`
 					}{
 						Filename: name,
-						FileData: "data:" + block.Source.MediaType + ";base64," + block.Source.Data,
+						FileData: "data:" + mediaType + ";base64," + block.Source.Data,
 					},
 				})
 			}
@@ -437,9 +456,17 @@ func anthropicBlocks(raw json.RawMessage) (string, []string, []contentPart) {
 
 // rawJSONObject keeps an arguments string as an object for the Anthropic
 // response, where `input` is typed as a map rather than as a string.
+//
+// A model that writes its arguments as a JSON *string* sometimes produces one
+// that starts with `{` but is not valid JSON — mixed quoting is the usual
+// failure. Marshalling such a RawMessage fails, the error was discarded, and
+// the client got a 200 with an empty body: a silently corrupted response with
+// nothing to debug from. Anything that is not a verifiably valid object is
+// replaced with an empty object instead, which keeps the tool_use block
+// well-formed and the arguments visible in the text the caller already has.
 func rawJSONObject(arguments string) json.RawMessage {
 	trimmed := strings.TrimSpace(arguments)
-	if trimmed == "" || trimmed[0] != '{' {
+	if trimmed == "" || trimmed[0] != '{' || !json.Valid([]byte(trimmed)) {
 		return json.RawMessage("{}")
 	}
 	return json.RawMessage(trimmed)
@@ -458,6 +485,7 @@ type anthropicStream struct {
 	messageID    string
 	modelID      string
 	inputTokens  int
+	started      bool
 	nextIndex    int
 	thinkingAt   int
 	textAt       int
@@ -477,14 +505,20 @@ func newAnthropicStream(out *respWriter, modelID string, inputTokens int) *anthr
 }
 
 func (s *anthropicStream) event(name string, payload map[string]any) {
-	ensureStreamHeaders(s.out)
-	raw, _ := json.Marshal(payload)
-	_, _ = fmt.Fprintf(s.out, "event: %s\ndata: %s\n\n", name, raw)
-	s.out.Flush()
+	s.ensureStarted()
+	s.emit(name, payload)
 }
 
-func (s *anthropicStream) start() {
-	s.event("message_start", map[string]any{
+// ensureStarted writes message_start ahead of the first event, whatever that
+// event turns out to be. The frame is deferred rather than written eagerly so
+// that a first attempt failing before any output leaves the response
+// uncommitted and free to fail over.
+func (s *anthropicStream) ensureStarted() {
+	if s.started {
+		return
+	}
+	s.started = true
+	s.emit("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
 			"id":            s.messageID,
@@ -497,6 +531,13 @@ func (s *anthropicStream) start() {
 			"usage":         map[string]any{"input_tokens": s.inputTokens, "output_tokens": 0},
 		},
 	})
+}
+
+func (s *anthropicStream) emit(name string, payload map[string]any) {
+	ensureStreamHeaders(s.out)
+	raw, _ := json.Marshal(payload)
+	_, _ = fmt.Fprintf(s.out, "event: %s\ndata: %s\n\n", name, raw)
+	s.out.Flush()
 }
 
 func (s *anthropicStream) openThinking() {

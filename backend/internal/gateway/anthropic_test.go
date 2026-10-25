@@ -400,3 +400,21 @@ func TestAnthropicMessagesForwardsImageBlocks(t *testing.T) {
 		t.Fatalf("content = %v", content)
 	}
 }
+
+// Arguments that arrive as a JSON string which starts with `{` but is not
+// valid JSON used to be emitted verbatim as `input`, and the marshal failure
+// turned the whole response into a 200 with an empty body.
+func TestRawJSONObjectRejectsInvalidJSON(t *testing.T) {
+	cases := map[string]string{
+		"{name: x}":     "{}",
+		"{'a':1}":       "{}",
+		"":              "{}",
+		"not json":      "{}",
+		`{"city":"上海"}`: `{"city":"上海"}`,
+	}
+	for input, want := range cases {
+		if got := string(rawJSONObject(input)); got != want {
+			t.Fatalf("rawJSONObject(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
