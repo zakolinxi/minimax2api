@@ -431,9 +431,20 @@ func claimPanel(before *minimax.SigninPanel, claim *minimax.SigninClaim) *minima
 // on failure so the day counts as served: otherwise a sweep in which every
 // account errored would be retried on the next tick, and a persistent upstream
 // outage would turn into a request loop.
+//
+// The one exception is a cancelled context: the sweep was aborted (shutdown, or
+// the operator stopped it), which says nothing about the account. Recording the
+// attempt would burn the day — the scheduler derives "already swept today" from
+// SigninAt — so the account is left untouched for the next run to retry.
 func (s *Service) fail(account *store.Account, result AccountResult, err error) AccountResult {
 	result.Status = store.SigninFailed
 	result.Error = truncate(err.Error(), 200)
+
+	if errors.Is(err, context.Canceled) {
+		result.Status = store.SigninSkipped
+		result.Error = "签到已取消"
+		return result
+	}
 
 	invalid := errors.Is(err, minimax.ErrInvalidCredential)
 	s.record(account.ID, func(target *store.Account) {

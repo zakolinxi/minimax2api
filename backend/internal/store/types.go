@@ -269,23 +269,28 @@ type ClientKey struct {
 }
 
 type Audit struct {
-	ID               string    `json:"id"`
-	CreatedAt        time.Time `json:"createdAt"`
-	KeyName          string    `json:"keyName"`
-	Model            string    `json:"model"`
-	AccountName      string    `json:"accountName"`
-	Status           int       `json:"status"`
-	LatencyMs        int64     `json:"latencyMs"`
-	FirstTokenMs     int64     `json:"firstTokenMs"`
-	PromptTokens     int       `json:"promptTokens"`
-	CompletionTokens int       `json:"completionTokens"`
-	Stream           bool      `json:"stream"`
-	Retries          int       `json:"retries"`
-	IP               string    `json:"ip"`
-	UserAgent        string    `json:"userAgent"`
-	Error            string    `json:"error"`
-	RequestBody      string    `json:"requestBody"`
-	ResponseBody     string    `json:"responseBody"`
+	ID        string    `json:"id"`
+	CreatedAt time.Time `json:"createdAt"`
+	// Action and Detail mark a console-initiated mutation (login, password
+	// change, account and key management). Gateway traffic leaves them empty;
+	// they are optional so older entries serialise unchanged.
+	Action           string `json:"action,omitempty"`
+	Detail           string `json:"detail,omitempty"`
+	KeyName          string `json:"keyName"`
+	Model            string `json:"model"`
+	AccountName      string `json:"accountName"`
+	Status           int    `json:"status"`
+	LatencyMs        int64  `json:"latencyMs"`
+	FirstTokenMs     int64  `json:"firstTokenMs"`
+	PromptTokens     int    `json:"promptTokens"`
+	CompletionTokens int    `json:"completionTokens"`
+	Stream           bool   `json:"stream"`
+	Retries          int    `json:"retries"`
+	IP               string `json:"ip"`
+	UserAgent        string `json:"userAgent"`
+	Error            string `json:"error"`
+	RequestBody      string `json:"requestBody"`
+	ResponseBody     string `json:"responseBody"`
 }
 
 type MediaItem struct {

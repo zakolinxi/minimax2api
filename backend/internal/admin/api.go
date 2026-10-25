@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +12,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"minimax2api/internal/config"
 	"minimax2api/internal/gateway"
@@ -33,6 +36,11 @@ type API struct {
 	browserLoginBridge string
 	httpClient         *http.Client
 	started            time.Time
+
+	// loginFailures counts consecutive password failures per source address so
+	// the login endpoint can lock out brute force. Guarded by loginMu.
+	loginMu       sync.Mutex
+	loginFailures map[string]*loginAttempt
 }
 
 func New(st *store.Store, p *pool.Pool, client *minimax.Client, signinSvc *signin.Service, settings func() config.Settings, browserLoginBridge string) *API {
@@ -41,60 +49,77 @@ func New(st *store.Store, p *pool.Pool, client *minimax.Client, signinSvc *signi
 		browserLoginBridge: strings.TrimRight(strings.TrimSpace(browserLoginBridge), "/"),
 		httpClient:         &http.Client{},
 		started:            time.Now(),
+		loginFailures:      make(map[string]*loginAttempt),
 	}
 }
 
 // Register installs every admin route on the mux.
 func (a *API) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /admin/api/auth/login", a.login)
-	mux.HandleFunc("GET /admin/api/auth/me", a.guard(a.me))
-	mux.HandleFunc("POST /admin/api/auth/logout", a.guard(a.logout))
-	mux.HandleFunc("POST /admin/api/auth/password", a.guard(a.changePassword))
+	// route registers one endpoint wrapped in withNoStore: every admin response
+	// needs it, so it is applied here once instead of per handler.
+	route := func(method, pattern string, handler http.HandlerFunc) {
+		mux.HandleFunc(method+" "+pattern, withNoStore(handler))
+	}
 
-	mux.HandleFunc("GET /admin/api/dashboard", a.guard(a.dashboard))
+	route("POST", "/admin/api/auth/login", a.login)
+	route("GET", "/admin/api/auth/me", a.guard(a.me))
+	route("POST", "/admin/api/auth/logout", a.guard(a.logout))
+	route("POST", "/admin/api/auth/password", a.guard(a.changePassword))
 
-	mux.HandleFunc("GET /admin/api/accounts", a.guard(a.listAccounts))
-	mux.HandleFunc("POST /admin/api/accounts", a.guard(a.createAccount))
-	mux.HandleFunc("GET /admin/api/accounts/groups", a.guard(a.accountGroups))
-	mux.HandleFunc("GET /admin/api/accounts/export", a.guard(a.exportAccounts))
-	mux.HandleFunc("POST /admin/api/accounts/import", a.guard(a.importAccounts))
-	mux.HandleFunc("POST /admin/api/accounts/batch", a.guard(a.batchAccounts))
-	mux.HandleFunc("POST /admin/api/accounts/probe-all", a.guard(a.probeAll))
-	mux.HandleFunc("POST /admin/api/accounts/quota-all", a.guard(a.quotaAll))
-	mux.HandleFunc("POST /admin/api/accounts/cleanup", a.guard(a.cleanupAccounts))
-	mux.HandleFunc("PATCH /admin/api/accounts/{id}", a.guard(a.updateAccount))
-	mux.HandleFunc("DELETE /admin/api/accounts/{id}", a.guard(a.deleteAccount))
-	mux.HandleFunc("POST /admin/api/accounts/{id}/probe", a.guard(a.probeAccount))
-	mux.HandleFunc("POST /admin/api/accounts/{id}/quota", a.guard(a.refreshQuota))
-	mux.HandleFunc("POST /admin/api/accounts/{id}/signin", a.guard(a.signinAccount))
-	mux.HandleFunc("POST /admin/api/accounts/{id}/credit", a.guard(a.refreshCredit))
+	route("GET", "/admin/api/dashboard", a.guard(a.dashboard))
 
-	mux.HandleFunc("GET /admin/api/signin", a.guard(a.signinOverview))
-	mux.HandleFunc("POST /admin/api/signin/run", a.guard(a.signinRun))
+	route("GET", "/admin/api/accounts", a.guard(a.listAccounts))
+	route("POST", "/admin/api/accounts", a.guard(a.createAccount))
+	route("GET", "/admin/api/accounts/groups", a.guard(a.accountGroups))
+	route("GET", "/admin/api/accounts/export", a.guard(a.exportAccounts))
+	route("POST", "/admin/api/accounts/import", a.guard(a.importAccounts))
+	route("POST", "/admin/api/accounts/batch", a.guard(a.batchAccounts))
+	route("POST", "/admin/api/accounts/probe-all", a.guard(a.probeAll))
+	route("POST", "/admin/api/accounts/quota-all", a.guard(a.quotaAll))
+	route("POST", "/admin/api/accounts/cleanup", a.guard(a.cleanupAccounts))
+	route("PATCH", "/admin/api/accounts/{id}", a.guard(a.updateAccount))
+	route("DELETE", "/admin/api/accounts/{id}", a.guard(a.deleteAccount))
+	route("POST", "/admin/api/accounts/{id}/probe", a.guard(a.probeAccount))
+	route("POST", "/admin/api/accounts/{id}/quota", a.guard(a.refreshQuota))
+	route("POST", "/admin/api/accounts/{id}/signin", a.guard(a.signinAccount))
+	route("POST", "/admin/api/accounts/{id}/credit", a.guard(a.refreshCredit))
 
-	mux.HandleFunc("GET /admin/api/client-keys", a.guard(a.listClientKeys))
-	mux.HandleFunc("POST /admin/api/client-keys", a.guard(a.createClientKey))
-	mux.HandleFunc("PATCH /admin/api/client-keys/{id}", a.guard(a.updateClientKey))
-	mux.HandleFunc("DELETE /admin/api/client-keys/{id}", a.guard(a.deleteClientKey))
+	route("GET", "/admin/api/signin", a.guard(a.signinOverview))
+	route("POST", "/admin/api/signin/run", a.guard(a.signinRun))
 
-	mux.HandleFunc("GET /admin/api/models", a.guard(a.listModels))
-	mux.HandleFunc("PATCH /admin/api/models/{id}", a.guard(a.updateModel))
+	route("GET", "/admin/api/client-keys", a.guard(a.listClientKeys))
+	route("POST", "/admin/api/client-keys", a.guard(a.createClientKey))
+	route("PATCH", "/admin/api/client-keys/{id}", a.guard(a.updateClientKey))
+	route("DELETE", "/admin/api/client-keys/{id}", a.guard(a.deleteClientKey))
 
-	mux.HandleFunc("GET /admin/api/audits", a.guard(a.listAudits))
-	mux.HandleFunc("DELETE /admin/api/audits", a.guard(a.clearAudits))
-	mux.HandleFunc("GET /admin/api/audits/{id}", a.guard(a.auditDetail))
+	route("GET", "/admin/api/models", a.guard(a.listModels))
+	route("PATCH", "/admin/api/models/{id}", a.guard(a.updateModel))
 
-	mux.HandleFunc("GET /admin/api/settings", a.guard(a.getSettings))
-	mux.HandleFunc("PUT /admin/api/settings", a.guard(a.saveSettings))
+	route("GET", "/admin/api/audits", a.guard(a.listAudits))
+	route("DELETE", "/admin/api/audits", a.guard(a.clearAudits))
+	route("GET", "/admin/api/audits/{id}", a.guard(a.auditDetail))
 
-	mux.HandleFunc("GET /admin/api/gallery", a.guard(a.gallery))
+	route("GET", "/admin/api/settings", a.guard(a.getSettings))
+	route("PUT", "/admin/api/settings", a.guard(a.saveSettings))
 
-	mux.HandleFunc("POST /admin/api/browser-login", a.guard(a.startBrowserLogin))
-	mux.HandleFunc("GET /admin/api/browser-login/{id}", a.guard(a.pollBrowserLogin))
-	mux.HandleFunc("DELETE /admin/api/browser-login/{id}", a.guard(a.cancelBrowserLogin))
+	route("GET", "/admin/api/gallery", a.guard(a.gallery))
+
+	route("POST", "/admin/api/browser-login", a.guard(a.startBrowserLogin))
+	route("GET", "/admin/api/browser-login/{id}", a.guard(a.pollBrowserLogin))
+	route("DELETE", "/admin/api/browser-login/{id}", a.guard(a.cancelBrowserLogin))
 }
 
 // ---------------------------------------------------------------- middleware
+
+// withNoStore marks every admin API response as uncacheable. Session tokens and
+// account credentials travel in these payloads; a shared cache keeping a copy
+// would hand them to the next user of the same cache entry.
+func withNoStore(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("cache-control", "no-store")
+		next(w, r)
+	}
+}
 
 type ctxKey string
 
@@ -127,21 +152,115 @@ type loginRequest struct {
 }
 
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
+	// The body carries nothing but two short strings. A tight bound keeps one
+	// client from parking memory with a giant request before any credential is
+	// checked.
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	var request loginRequest
 	if err := decode(r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	if !a.store.VerifyPassword(strings.TrimSpace(request.Username), request.Password) {
+	username := strings.TrimSpace(request.Username)
+
+	// Brute force lockout. The key is the connection's source address: an
+	// X-Forwarded-For header is attacker-controlled and would let a client
+	// rotate its identity per attempt.
+	host := remoteHost(r)
+	if remaining, locked := a.loginLocked(host); locked {
+		w.Header().Set("retry-after", strconv.Itoa(int(remaining.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, fmt.Sprintf("失败次数过多，请 %d 秒后重试", int(remaining.Seconds())+1))
+		return
+	}
+	if !a.store.VerifyPassword(username, request.Password) {
+		a.recordLoginFailure(host)
 		writeError(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
+	a.clearLoginFailures(host)
+	a.recordAdminAction(r, "登录成功", "用户 "+username)
 	token, _ := a.store.IssueSession()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":    token,
 		"username": request.Username,
 		"role":     "admin",
 	})
+}
+
+// loginAttempt is one source address's consecutive failure record.
+type loginAttempt struct {
+	failures  int
+	lastFail  time.Time
+	lockUntil time.Time
+}
+
+const (
+	// loginFailLimit is how many consecutive failures unlock the penalty.
+	loginFailLimit = 5
+	// loginLockBase is the first lockout; it doubles per extra failure.
+	loginLockBase = time.Minute
+	// loginLockMax caps the doubling so an attacker cannot price out the
+	// operator's own ability to come back.
+	loginLockMax = 15 * time.Minute
+	// loginAttemptIdle drops an address's record after this long without a
+	// failure, so the map cannot grow with every scanner on the internet.
+	loginAttemptIdle = time.Hour
+)
+
+// loginLocked reports how much longer the address is locked out.
+func (a *API) loginLocked(host string) (time.Duration, bool) {
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
+	attempt, ok := a.loginFailures[host]
+	if !ok {
+		return 0, false
+	}
+	if remaining := time.Until(attempt.lockUntil); remaining > 0 {
+		return remaining, true
+	}
+	return 0, false
+}
+
+// recordLoginFailure counts one failed attempt and, from the fifth consecutive
+// one on, starts (or extends) the exponential lockout.
+func (a *API) recordLoginFailure(host string) {
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
+	a.pruneLoginFailuresLocked()
+	now := time.Now()
+	attempt, ok := a.loginFailures[host]
+	if !ok {
+		attempt = &loginAttempt{}
+		a.loginFailures[host] = attempt
+	}
+	attempt.failures++
+	attempt.lastFail = now
+	if attempt.failures >= loginFailLimit {
+		lock := loginLockBase << uint(minInt(attempt.failures-loginFailLimit, 8))
+		if lock > loginLockMax || lock <= 0 {
+			lock = loginLockMax
+		}
+		attempt.lockUntil = now.Add(lock)
+	}
+}
+
+// clearLoginFailures wipes an address's record after a successful login.
+func (a *API) clearLoginFailures(host string) {
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
+	delete(a.loginFailures, host)
+}
+
+// pruneLoginFailuresLocked drops records that have been idle (and unlocked) for
+// too long. Called on the failure path only: that keeps the map bounded without
+// a background sweeper, and a stale entry is harmless on the read path.
+func (a *API) pruneLoginFailuresLocked() {
+	now := time.Now()
+	for host, attempt := range a.loginFailures {
+		if now.Sub(attempt.lastFail) > loginAttemptIdle && attempt.lockUntil.Before(now) {
+			delete(a.loginFailures, host)
+		}
+	}
 }
 
 func (a *API) me(w http.ResponseWriter, r *http.Request) {
@@ -173,6 +292,7 @@ func (a *API) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.store.RevokeAllSessions()
+	a.recordAdminAction(r, "修改密码", "用户 "+admin.Username)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -203,7 +323,6 @@ func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 		failures         int
 		promptTokens     int
 		completionTokens int
-		reasoningTokens  int
 		firstTokenSum    int64
 		firstTokenCount  int
 		latencySum       int64
@@ -345,19 +464,15 @@ func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"usage": map[string]any{
-			"requests":                     requests,
-			"failedRequests":               failures,
-			"successRate":                  successRate,
-			"inputTokens":                  promptTokens,
-			"outputTokens":                 completionTokens,
-			"reasoningTokens":              reasoningTokens,
-			"tokens":                       promptTokens + completionTokens,
-			"averageFirstTokenMs":          averageFirstToken,
-			"firstTokenSamples":            firstTokenCount,
-			"averageLatencyMs":             averageLatency,
-			"averageOutputTokensPerSecond": 0,
-			"throughputSamples":            0,
-			"estimatedCostUsd":             0,
+			"requests":            requests,
+			"failedRequests":      failures,
+			"successRate":         successRate,
+			"inputTokens":         promptTokens,
+			"outputTokens":        completionTokens,
+			"tokens":              promptTokens + completionTokens,
+			"averageFirstTokenMs": averageFirstToken,
+			"firstTokenSamples":   firstTokenCount,
+			"averageLatencyMs":    averageLatency,
 		},
 		"resources": map[string]any{
 			"totalAccounts":    len(accounts),
@@ -434,7 +549,16 @@ func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if subscribed != "" {
-			if wanted := subscribed == "true"; account.Subscribed() != wanted {
+			// Truthy spellings the console and hand-written URLs both use; anything
+			// else asks for the complement. Case-insensitive because query strings
+			// have no canonical casing.
+			wanted := true
+			switch strings.ToLower(strings.TrimSpace(subscribed)) {
+			case "1", "true", "yes":
+			default:
+				wanted = false
+			}
+			if account.Subscribed() != wanted {
 				continue
 			}
 		}
@@ -451,14 +575,7 @@ func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
 	sortViews(views, sortBy, sortOrder)
 
 	total := len(views)
-	start := (page - 1) * pageSize
-	if start > total {
-		start = total
-	}
-	end := start + pageSize
-	if end > total {
-		end = total
-	}
+	start, end := pageBounds(page, pageSize, total)
 
 	_, active, cooldown, disabled, invalid, routable := a.pool.Summary()
 
@@ -561,10 +678,11 @@ func (a *API) createAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.recordAdminAction(r, "创建账号", account.Name+"（"+account.ID+"）")
 
 	// The probe talks to the upstream and can take a while, so the account is
 	// returned immediately and the probe continues in background.
-	go a.syncQuotaDetached(account.ID)
+	a.goSyncQuotaDetached(account.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"account": a.view(account.ID)})
 }
 
@@ -720,6 +838,25 @@ func (a *API) updateAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
+	// Validated before the update runs: region has only three meanings here —
+	// omitted (leave alone), auto (re-infer from the token), or one of the two
+	// deployments. Anything else used to be stored verbatim and silently
+	// produced an account that could never be routed.
+	if raw := strings.TrimSpace(payload.Region); raw != "" && !isAutoRegion(raw) && normalizeRegion(raw) == "" {
+		writeError(w, http.StatusBadRequest, "区域仅支持 cn / global / auto")
+		return
+	}
+	// Same rules as createAccount: a token worth storing is a whole token.
+	if token := strings.TrimSpace(payload.Token); token != "" {
+		if strings.ContainsAny(token, " \t\r\n") {
+			writeError(w, http.StatusBadRequest, "Token 中不能包含空白字符，请只粘贴令牌本身")
+			return
+		}
+		if len(token) < 16 {
+			writeError(w, http.StatusBadRequest, "Token 长度异常，请确认粘贴的是完整令牌")
+			return
+		}
+	}
 	tokenReplaced := false
 	account, err := a.store.UpdateAccount(id, func(account *store.Account) {
 		if strings.TrimSpace(payload.Name) != "" {
@@ -741,17 +878,14 @@ func (a *API) updateAccount(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if raw := strings.TrimSpace(payload.Region); raw != "" {
-			switch {
-			case isAutoRegion(raw):
+			if isAutoRegion(raw) {
 				// "let the token decide" — re-infer, which is what an operator
 				// wants right after pasting a token taken from the other site.
 				if inferred := regionFromToken(account.Token); inferred != "" {
 					account.Region = inferred
 				}
-			case normalizeRegion(raw) != "":
+			} else {
 				account.Region = normalizeRegion(raw)
-			default:
-				account.Region = raw
 			}
 		} else if tokenReplaced {
 			// A replacement token brings its own deployment. Keeping the region
@@ -802,10 +936,12 @@ func (a *API) updateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deleteAccount(w http.ResponseWriter, r *http.Request) {
-	if err := a.store.DeleteAccount(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := a.store.DeleteAccount(id); err != nil {
 		writeError(w, http.StatusNotFound, "账号不存在")
 		return
 	}
+	a.recordAdminAction(r, "删除账号", id)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -831,6 +967,7 @@ func (a *API) batchAccounts(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		a.recordAdminAction(r, "批量删除账号", fmt.Sprintf("请求 %d 个，删除 %d 个", len(payload.IDs), deleted))
 		writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
 	case "enable", "disable":
 		enabled := payload.Action == "enable"
@@ -860,6 +997,13 @@ func (a *API) batchAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"updated": updated})
 	case "concurrency":
+		// Unlike the client-key limiter, zero is not "unlimited" here — an
+		// account always needs a concrete ceiling. Silently treating a missing
+		// value as 1 would throttle accounts the operator never meant to touch.
+		if payload.MaxConcurrent <= 0 {
+			writeError(w, http.StatusBadRequest, "必须提供 maxConcurrent（1-256）")
+			return
+		}
 		value := clampInt(payload.MaxConcurrent, 1, 256)
 		updated, err := a.store.UpdateAccounts(payload.IDs, func(account *store.Account) {
 			account.MaxConcurrent = value
@@ -872,7 +1016,16 @@ func (a *API) batchAccounts(w http.ResponseWriter, r *http.Request) {
 	case "quota":
 		succeeded, failed := 0, 0
 		for _, id := range payload.IDs {
+			if r.Context().Err() != nil {
+				break
+			}
 			if err := a.syncQuota(r.Context(), id); err != nil {
+				if canceled(r.Context(), err) {
+					// The caller hung up (or the per-call budget ran out): that
+					// says nothing about the account, and syncQuota has already
+					// left its state untouched.
+					continue
+				}
 				failed++
 				continue
 			}
@@ -901,6 +1054,7 @@ func (a *API) cleanupAccounts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.recordAdminAction(r, "清理账号", fmt.Sprintf("状态 %s，删除 %d 个", strings.Join(payload.Statuses, ","), deleted))
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
 }
 
@@ -931,14 +1085,21 @@ func (a *API) importAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, entry := range entries {
+		importRegion := firstNonEmpty(entry.Region, payload.Region)
+		enabled := true
+		if entry.Enabled != nil {
+			enabled = *entry.Enabled
+		}
 		account, err := buildAccount(accountPayload{
 			Name: entry.Name, Token: entry.Token,
-			Region: firstNonEmpty(entry.Region, payload.Region),
+			Region: importRegion,
 			UserID: entry.UserID, Identifier: entry.Identifier, AgentID: entry.AgentID,
 			DeviceID: entry.DeviceID, UUID: entry.UUID,
 			ScreenWidth: entry.ScreenWidth, ScreenHeight: entry.ScreenHeight,
 			BaseURL: entry.BaseURL, Group: entry.Group, Remark: entry.Remark,
 			Priority: entry.Priority, MaxConcurrent: entry.MaxConcurrent,
+			Kind:    entry.Kind,
+			Enabled: &enabled,
 		})
 		if err != nil {
 			record(entry.Token, err)
@@ -950,9 +1111,21 @@ func (a *API) importAccounts(w http.ResponseWriter, r *http.Request) {
 			// so an existing entry is updated rather than rejected.
 			_, err := a.store.UpdateAccount(existing.ID, func(target *store.Account) {
 				target.Token = account.Token
-				target.Region = account.Region
+				// A region only travels here when the import record named one.
+				// Overwriting unconditionally used to let a region-less
+				// re-import stomp the operator's manual region with the token's
+				// own inference.
+				if importRegion != "" {
+					target.Region = account.Region
+				}
 				if entry.Name != "" {
 					target.Name = entry.Name
+				}
+				if entry.Kind != "" {
+					target.Kind = entry.Kind
+				}
+				if entry.Enabled != nil {
+					target.Enabled = *entry.Enabled
 				}
 				if account.UserID != "" {
 					target.UserID = account.UserID
@@ -979,6 +1152,7 @@ func (a *API) importAccounts(w http.ResponseWriter, r *http.Request) {
 		created++
 	}
 
+	a.recordAdminAction(r, "导入账号", fmt.Sprintf("新建 %d，更新 %d，失败 %d", created, updated, failed))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"created": created, "updated": updated, "failed": failed, "errors": failures,
 	})
@@ -998,6 +1172,8 @@ type importEntry struct {
 	Name          string `json:"name"`
 	Token         string `json:"token"`
 	Region        string `json:"region"`
+	Kind          string `json:"kind"`
+	Enabled       *bool  `json:"enabled"`
 	UserID        string `json:"userId"`
 	Identifier    string `json:"identifier"`
 	AgentID       string `json:"agentID"`
@@ -1127,9 +1303,16 @@ func (a *API) exportAccounts(w http.ResponseWriter, r *http.Request) {
 	for _, account := range accounts {
 		// The export is the import format: everything needed to rebuild the
 		// account, including the fingerprint, so a round trip through a file
-		// preserves the exact identity the token was issued to.
+		// preserves the exact identity the token was issued to. Kind and
+		// Enabled travel too — they used to be dropped, so an exported pool
+		// came back as enabled tokens.
+		kind := account.Kind
+		if kind == "" {
+			kind = store.KindToken
+		}
 		out = append(out, map[string]any{
 			"name": account.Name, "token": account.Token, "region": account.Region,
+			"kind": kind, "enabled": account.Enabled,
 			"userId": account.UserID, "identifier": account.Identifier,
 			"agentID": account.AgentID, "deviceID": account.DeviceID, "uuid": account.UUID,
 			"screenWidth": account.ScreenWidth, "screenHeight": account.ScreenHeight,
@@ -1164,25 +1347,30 @@ func (a *API) probeAccount(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		message = err.Error()
 	}
-	a.store.SaveAccountState(id, func(account *store.Account) {
-		account.Quota = &store.Quota{
-			SyncedAt: time.Now(), Available: err == nil, LatencyMs: latency,
-			Plan: quotaPlan(account), Note: message,
-		}
-		if err != nil {
-			if err == minimax.ErrInvalidCredential {
-				account.Status = store.StatusInvalid
-			} else if account.Status != store.StatusDisabled {
-				account.Status = store.StatusCooldown
-				account.CooldownUntil = time.Now().Add(a.settings().CooldownBase())
+	// A cancelled or expired context says nothing about the account: the
+	// operator closed the tab, or the probe budget ran out. Writing cooldown
+	// for it used to take healthy accounts out of rotation for nothing.
+	if !canceled(probeCtx, err) {
+		a.store.SaveAccountState(id, func(account *store.Account) {
+			account.Quota = &store.Quota{
+				SyncedAt: time.Now(), Available: err == nil, LatencyMs: latency,
+				Plan: quotaPlan(account), Note: message,
 			}
-			account.LastError = truncate(message, 200)
-			return
-		}
-		account.Status = store.StatusActive
-		account.CooldownUntil = time.Time{}
-		account.LastError = ""
-	})
+			if err != nil {
+				if err == minimax.ErrInvalidCredential {
+					account.Status = store.StatusInvalid
+				} else if account.Status != store.StatusDisabled {
+					account.Status = store.StatusCooldown
+					account.CooldownUntil = time.Now().Add(a.settings().CooldownBase())
+				}
+				account.LastError = truncate(message, 200)
+				return
+			}
+			account.Status = store.StatusActive
+			account.CooldownUntil = time.Time{}
+			account.LastError = ""
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": err == nil, "latencyMs": latency, "message": message, "account": a.view(id),
 	})
@@ -1192,6 +1380,12 @@ func (a *API) probeAll(w http.ResponseWriter, r *http.Request) {
 	accounts := a.store.ListAccounts()
 	healthy, unhealthy := 0, 0
 	for _, account := range accounts {
+		// Stop spending requests the moment the caller is gone; otherwise the
+		// rest of the pool would be punished for errors that are really the
+		// cancelled request.
+		if r.Context().Err() != nil {
+			break
+		}
 		if !account.Enabled {
 			continue
 		}
@@ -1207,6 +1401,12 @@ func (a *API) probeAll(w http.ResponseWriter, r *http.Request) {
 		_, err := a.client.Probe(ctx, gateway.CredentialOf(current))
 		cancel()
 		if err != nil {
+			if canceled(r.Context(), err) {
+				// Caller cancellation or an exhausted probe budget is not
+				// evidence about the account: leave its state alone and move
+				// on (the loop head stops the sweep once the caller is gone).
+				continue
+			}
 			unhealthy++
 			a.store.SaveAccountState(account.ID, func(target *store.Account) {
 				target.LastError = truncate(err.Error(), 200)
@@ -1245,17 +1445,40 @@ func (a *API) quotaAll(w http.ResponseWriter, r *http.Request) {
 	accounts := a.store.ListAccounts()
 	succeeded, failed := 0, 0
 	for _, account := range accounts {
+		// Same guard as probeAll: once the caller is gone, stop before the
+		// remaining accounts get punished for a cancelled request.
+		if r.Context().Err() != nil {
+			break
+		}
 		if !account.Enabled {
 			continue
 		}
 		a.prepareAccount(r.Context(), account.ID)
 		if err := a.syncQuota(r.Context(), account.ID); err != nil {
+			if canceled(r.Context(), err) {
+				continue
+			}
 			failed++
 			continue
 		}
 		succeeded++
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"succeeded": succeeded, "failed": failed})
+}
+
+// detachedQuotaSlots caps how many background quota syncs run at once. A bulk
+// import would otherwise launch one goroutine per account — each holding an
+// upstream ping — and eight concurrent probes is plenty for a console.
+var detachedQuotaSlots = make(chan struct{}, 8)
+
+// goSyncQuotaDetached runs syncQuotaDetached on a goroutine bounded by the
+// semaphore above.
+func (a *API) goSyncQuotaDetached(id string) {
+	go func() {
+		detachedQuotaSlots <- struct{}{}
+		defer func() { <-detachedQuotaSlots }()
+		a.syncQuotaDetached(id)
+	}()
 }
 
 // syncQuotaDetached runs a quota probe outside the request lifecycle with a
@@ -1375,6 +1598,12 @@ func (a *API) syncQuota(ctx context.Context, id string) error {
 		note = "上游连通，未返回内容"
 	}
 
+	// Cancellation and deadline exhaustion belong to the caller or the probe
+	// budget, not the account: writing cooldown and Available=false for them
+	// used to bench healthy accounts whenever the console moved on.
+	if canceled(ctx, err) {
+		return err
+	}
 	a.store.SaveAccountState(id, func(target *store.Account) {
 		target.Quota = &store.Quota{
 			SyncedAt: time.Now(), Available: available, LatencyMs: latency,
@@ -1467,8 +1696,13 @@ func (a *API) signinOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 // signinRun triggers a sweep outside the schedule.
+//
+// The sweep runs on Background rather than the request context: it walks the
+// whole pool with gaps between accounts, so it outlives the HTTP call that
+// started it, and a client disconnect (or a console refresh) must not stop it
+// halfway — the accounts it never reached would simply lose the day.
 func (a *API) signinRun(w http.ResponseWriter, r *http.Request) {
-	report := a.signin.Sweep(r.Context())
+	report := a.signin.Sweep(context.Background())
 	if report == nil {
 		writeError(w, http.StatusConflict, "已有签到任务在执行，请稍候")
 		return
@@ -1565,6 +1799,7 @@ func (a *API) createClientKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.recordAdminAction(r, "创建客户端密钥", key.Name+"（"+key.ID+"）")
 	writeJSON(w, http.StatusOK, map[string]any{"key": map[string]any{
 		"id": key.ID, "name": key.Name, "key": key.Key, "maskedKey": maskKey(key.Key),
 		"enabled": key.Enabled, "rpmLimit": key.RPMLimit, "maxConcurrent": key.MaxConcurrent,
@@ -1609,10 +1844,12 @@ func (a *API) updateClientKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deleteClientKey(w http.ResponseWriter, r *http.Request) {
-	if err := a.store.DeleteClientKey(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := a.store.DeleteClientKey(id); err != nil {
 		writeError(w, http.StatusNotFound, "密钥不存在")
 		return
 	}
+	a.recordAdminAction(r, "删除客户端密钥", id)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -1647,6 +1884,7 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "模型不存在")
 		return
 	}
+	a.recordAdminAction(r, "修改模型", model.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"model": model})
 }
 
@@ -1680,11 +1918,7 @@ func (a *API) listAudits(w http.ResponseWriter, r *http.Request) {
 	}
 
 	total := len(filtered)
-	start := (page - 1) * pageSize
-	if start > total {
-		start = total
-	}
-	end := minInt(start+pageSize, total)
+	start, end := pageBounds(page, pageSize, total)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items": filtered[start:end], "total": total, "page": page, "pageSize": pageSize,
@@ -1723,6 +1957,7 @@ func (a *API) clearAudits(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.recordAdminAction(r, "清空审计日志")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -1754,11 +1989,12 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 			"proxy":                settings.Upstream.Proxy, "userAgent": settings.Upstream.UserAgent,
 			"streamBaseURL": settings.Upstream.StreamBaseURL,
 		},
-		"routing": settings.Routing,
-		"audit":   settings.Audit,
-		"media":   settings.Media,
-		"signin":  settings.Signin,
-		"video":   settings.Video,
+		"routing":  settings.Routing,
+		"audit":    settings.Audit,
+		"media":    settings.Media,
+		"signin":   settings.Signin,
+		"video":    settings.Video,
+		"security": settings.Security,
 		"about": map[string]any{
 			"version": gateway.Version, "buildTime": a.started.Format(time.RFC3339),
 			"dataDir": a.store.DataDir(), "upstreamURL": settings.Upstream.BaseURL,
@@ -1768,14 +2004,21 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) saveSettings(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
-		Server        *config.ServerSettings   `json:"server"`
-		Upstream      *config.UpstreamSettings `json:"upstream"`
-		Routing       *config.RoutingSettings  `json:"routing"`
-		Audit         *config.AuditSettings    `json:"audit"`
-		Media         *config.MediaSettings    `json:"media"`
-		Signin        *config.SigninSettings   `json:"signin"`
-		Video         *config.VideoSettings    `json:"video"`
-		AdminPassword string                   `json:"adminPassword"`
+		Server   *config.ServerSettings   `json:"server"`
+		Upstream *config.UpstreamSettings `json:"upstream"`
+		Routing  *config.RoutingSettings  `json:"routing"`
+		Audit    *config.AuditSettings    `json:"audit"`
+		Media    *config.MediaSettings    `json:"media"`
+		Signin   *config.SigninSettings   `json:"signin"`
+		Video    *config.VideoSettings    `json:"video"`
+		Security *config.SecuritySettings `json:"security"`
+		// AdminPassword is accepted (older console builds still send it) but
+		// deliberately ignored. Changing the password here used to skip the
+		// old-password check and the session revocation that the dedicated
+		// POST /admin/api/auth/password endpoint performs, and a settings save
+		// that partially committed a password change was indistinguishable from
+		// one that did not. Password changes belong to that endpoint only.
+		AdminPassword string `json:"adminPassword"`
 	}
 	if err := decode(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "请求格式错误")
@@ -1806,24 +2049,16 @@ func (a *API) saveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if payload.Video != nil {
 			settings.Video = *payload.Video
+			if payload.Security != nil {
+				settings.Security = *payload.Security
+			}
 		}
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	if payload.AdminPassword != "" {
-		admin := a.store.AdminProfile()
-		username := admin.Username
-		if payload.Server != nil && strings.TrimSpace(payload.Server.AdminUsername) != "" {
-			username = strings.TrimSpace(payload.Server.AdminUsername)
-		}
-		if err := a.store.SetPassword(username, payload.AdminPassword); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
-
+	a.recordAdminAction(r, "保存设置")
 	a.getSettings(w, r)
 }
 
@@ -1917,9 +2152,85 @@ func firstNonZero(values ...int) int {
 	return 0
 }
 
+// truncate bounds a string for storage and display, cutting on a rune
+// boundary. Slicing at a fixed byte offset can split a multi-byte character,
+// which would push invalid UTF-8 into lastError and from there into the
+// console.
 func truncate(value string, limit int) string {
 	if len(value) <= limit {
 		return value
 	}
-	return value[:limit] + "…"
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + "…"
+}
+
+// maxPage caps the page parameter. The console never pages anywhere near this
+// deep, and without a cap a query like page=9223372036854775807 used to make
+// (page-1)*pageSize overflow negative, slip past the start>total check and
+// panic the slice below.
+const maxPage = 1_000_000
+
+// pageBounds clamps the requested page and resolves it into slice bounds over
+// a filtered list of the given total.
+func pageBounds(page, pageSize, total int) (start, end int) {
+	page = clampInt(page, 1, maxPage)
+	start = (page - 1) * pageSize
+	// Defensive: even with the cap, a negative start must never reach the
+	// slice expression.
+	if start < 0 || start > total {
+		start = total
+	}
+	return start, minInt(start+pageSize, total)
+}
+
+// canceled reports whether an error is the caller — or a probe budget — giving
+// up rather than the account failing. Such an error must never be written into
+// an account's status: a cancelled request would otherwise bench the whole
+// remaining pool as cooldown.
+func canceled(ctx context.Context, err error) bool {
+	return ctx.Err() != nil ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
+// remoteHost extracts the connection's source address. It deliberately ignores
+// X-Forwarded-For: that header is client-controlled and must never decide
+// security-relevant behaviour such as rate limiting.
+func remoteHost(r *http.Request) string {
+	host := r.RemoteAddr
+	if index := strings.LastIndex(host, ":"); index >= 0 {
+		host = host[:index]
+	}
+	return host
+}
+
+// recordAdminAction writes an audit entry for a console-initiated mutation.
+// The gateway records API traffic on its own; these entries exist so the audit
+// log also answers "who changed what in the console". The optional detail
+// carries the key parameters (account id, counts) of the action.
+func (a *API) recordAdminAction(r *http.Request, action string, detail ...string) {
+	entry := &store.Audit{
+		ID:        "req_" + randomID(10),
+		CreatedAt: time.Now(),
+		IP:        remoteHost(r),
+		UserAgent: r.Header.Get("user-agent"),
+		Action:    action,
+	}
+	if len(detail) > 0 {
+		entry.Detail = strings.Join(detail, "；")
+	}
+	a.store.AppendAudit(entry)
+}
+
+// randomID mirrors the gateway's audit id shape, so console entries and traffic
+// entries are indistinguishable in the list.
+func randomID(length int) string {
+	buf := make([]byte, (length+1)/2)
+	if _, err := rand.Read(buf); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	return hex.EncodeToString(buf)[:length]
 }

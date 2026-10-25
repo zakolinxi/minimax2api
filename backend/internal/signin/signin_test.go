@@ -579,6 +579,44 @@ func TestAFailedOpeningSequenceSkipsTheClaim(t *testing.T) {
 	}
 }
 
+// TestCancelledAttemptDoesNotBurnTheDay: a cancelled context is the caller
+// giving up (shutdown, aborted sweep), not the account failing. Recording the
+// attempt would stamp SigninAt, the scheduler would treat today as served, and
+// the sweep would never be retried — so the account must be left untouched.
+func TestCancelledAttemptDoesNotBurnTheDay(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+	f.client.prepareErr = context.Canceled
+
+	report := f.service.Sweep(context.Background())
+
+	account, _ := f.store.AccountByID(f.account.ID)
+	if !account.SigninAt.IsZero() {
+		t.Fatal("a cancelled attempt must not stamp SigninAt, or the day reads as served")
+	}
+	if account.SigninStatus != "" {
+		t.Errorf("signin status = %q, want untouched", account.SigninStatus)
+	}
+	if report.Failed != 0 {
+		t.Errorf("report.Failed = %d, want 0: a cancellation is not an account failure", report.Failed)
+	}
+
+	// The day is still open: the next tick must reconsider the slot instead of
+	// skipping to tomorrow.
+	if got := f.service.NextRun(f.service.clock()); !got.Equal(f.service.clock()) {
+		t.Errorf("NextRun = %v, want now (the day is still unserved)", got)
+	}
+
+	// A deadline miss is a different thing: the call really was made and lost,
+	// so the day still counts as served.
+	f2 := newFixture(t, defaultSettings())
+	f2.client.prepareErr = context.DeadlineExceeded
+	f2.service.Sweep(context.Background())
+	timedOut, _ := f2.store.AccountByID(f2.account.ID)
+	if timedOut.SigninAt.IsZero() {
+		t.Error("a deadline miss is a real attempt and must still stamp the day")
+	}
+}
+
 // --- reconciling -----------------------------------------------------------
 
 // claimAgo backdates the account's last claim so the reconciliation grace period
