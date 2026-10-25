@@ -91,7 +91,6 @@ function DashboardOverview({ dashboard, loading }: { dashboard?: DashboardDTO; l
   const usage = dashboard?.usage;
   const resources = dashboard?.resources;
   const totalAccounts = resources?.totalAccounts ?? 0;
-  const reasoningRate = (usage?.outputTokens ?? 0) > 0 ? ((usage?.reasoningTokens ?? 0) / (usage?.outputTokens ?? 1)) * 100 : 0;
   const hasFirstTokenSamples = (usage?.firstTokenSamples ?? 0) > 0;
 
   return (
@@ -115,13 +114,9 @@ function DashboardOverview({ dashboard, loading }: { dashboard?: DashboardDTO; l
           detail={t("dashboard.requestSuccessRate", { rate: formatNumber(usage?.successRate ?? 0, i18n.language, 1) })}
           loading={loading}
         />
-        <DashboardMetric
-          icon={WholeWord}
-          label={t("dashboard.tokens")}
-          value={formatTokens(usage?.tokens ?? 0, i18n.language)}
-          detail={t("dashboard.tokenEfficiency", { rate: formatNumber(reasoningRate, i18n.language, 1) })}
-          loading={loading}
-        />
+        {/* The reasoning-token share used to ride on this card as a detail; the
+            upstream number is estimated, not measured, so it is gone. */}
+        <DashboardMetric icon={WholeWord} label={t("dashboard.tokens")} value={formatTokens(usage?.tokens ?? 0, i18n.language)} loading={loading} />
         <DashboardMetric
           icon={CircleDollarSign}
           label={t("audits.averageFirstToken")}
@@ -129,11 +124,12 @@ function DashboardOverview({ dashboard, loading }: { dashboard?: DashboardDTO; l
           detail={t("dashboard.firstTokenDetail", { count: formatNumber(usage?.firstTokenSamples ?? 0, i18n.language) })}
           loading={loading}
         />
+        {/* The tok/s detail came from an output-speed estimate with the same
+            problem, so the card reports the measured latency alone. */}
         <DashboardMetric
           icon={Gauge}
           label={t("dashboard.averageLatency")}
           value={formatDuration(usage?.averageLatencyMs ?? 0)}
-          detail={`${formatNumber(usage?.averageOutputTokensPerSecond ?? 0, i18n.language, 1)} tok/s`}
           loading={loading}
         />
       </div>
@@ -151,7 +147,7 @@ function DashboardMetric({
   icon: LucideIcon;
   label: string;
   value: string;
-  detail: string;
+  detail?: string;
   loading: boolean;
 }) {
   return (
@@ -163,9 +159,11 @@ function DashboardMetric({
       <div className="mt-2 flex min-h-8 items-center text-xl font-medium tracking-tight tabular-nums sm:mt-3 sm:text-2xl">
         {loading ? <Spinner /> : value}
       </div>
-      <p className={cn("mt-1.5 min-h-4 truncate text-[11px] text-muted-foreground", loading && "invisible")} title={detail}>
-        {detail}
-      </p>
+      {detail ? (
+        <p className="mt-1.5 min-h-4 truncate text-[11px] text-muted-foreground" title={detail}>
+          {detail}
+        </p>
+      ) : null}
     </article>
   );
 }

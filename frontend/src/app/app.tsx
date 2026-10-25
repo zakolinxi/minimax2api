@@ -6,6 +6,7 @@ import { Toaster } from "sonner";
 
 import { router } from "@/app/router";
 import { AuthProvider } from "@/shared/auth/auth-context";
+import { ThemeColorSync } from "@/shared/components/theme-color-sync";
 
 export function App() {
   const [queryClient] = useState(
@@ -23,6 +24,10 @@ export function App() {
 
   return (
     <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+      {/* Mounted here — inside ThemeProvider, above the router — so the
+          theme-color metas follow the resolved theme on the login page too,
+          not only inside the admin shell. */}
+      <ThemeColorSync />
       <QueryClientProvider client={queryClient}>
         <AuthProvider>
           <RouterProvider router={router} />

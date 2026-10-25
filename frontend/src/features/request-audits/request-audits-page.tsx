@@ -63,6 +63,21 @@ export function RequestAuditsPage() {
 
   const items = auditsQuery.data?.items ?? [];
 
+  // A page can empty out from under the operator (record retention, another
+  // admin clearing). placeholderData keeps the stale rows visible, so fall back
+  // to page 1 once the settled result proves the current page is out of range —
+  // the guards keep the effect from re-firing on the same result.
+  useEffect(() => {
+    const data = auditsQuery.data;
+    if (!data) return;
+    const totalPages = Math.max(1, Math.ceil(data.total / pageSize));
+    if (data.items.length === 0 && data.total > 0 && page > 1) {
+      setPage(1);
+    } else if (page > totalPages) {
+      setPage(1);
+    }
+  }, [auditsQuery.data, page, pageSize]);
+
   return (
     <div className="space-y-5">
       <PageHeader title={t("audits.title")} description={t("audits.description")} />
@@ -156,7 +171,23 @@ export function RequestAuditsPage() {
                   <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
                     {formatDateTime(item.createdAt, i18n.language)}
                   </TableCell>
-                  <TableCell className="text-xs">{item.model}</TableCell>
+                  <TableCell className="text-xs">
+                    {/* Management operations are audited with action/detail and
+                        no model; the action takes the model column's place so
+                        the row does not read as an empty request. */}
+                    {item.action ? (
+                      <div className="min-w-0">
+                        <p className="truncate">{item.action}</p>
+                        {item.detail ? (
+                          <p className="mt-0.5 truncate text-[10px] text-muted-foreground" title={item.detail}>
+                            {item.detail}
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : (
+                      item.model || "—"
+                    )}
+                  </TableCell>
                   <TableCell className="hidden text-xs text-muted-foreground md:table-cell">{item.keyName || "—"}</TableCell>
                   <TableCell className="hidden text-xs text-muted-foreground md:table-cell">{item.accountName || "—"}</TableCell>
                   <TableCell className="text-center">

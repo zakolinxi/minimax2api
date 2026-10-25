@@ -41,41 +41,50 @@ export function GalleryPage() {
         <EmptyState label={t("common.empty")} />
       ) : (
         <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-          {items.map((item) => (
-            <article key={item.id} className="overflow-hidden rounded-lg bg-card">
-              <div className="relative aspect-square bg-secondary/60">
-                {item.kind === "image" ? (
-                  <img src={item.url} alt={item.prompt} loading="lazy" className="size-full object-cover" />
-                ) : (
-                  <video src={item.url} controls className="size-full object-cover" />
-                )}
-                <Badge variant="secondary" className="absolute left-2 top-2 bg-background/85 backdrop-blur">
-                  {item.kind === "image" ? t("models.typeImage") : t("models.typeVideo")}
-                </Badge>
-              </div>
-              <div className="space-y-2 p-3">
-                <p className="line-clamp-2 min-h-8 text-[11px] leading-4 text-muted-foreground" title={item.prompt}>
-                  {item.prompt || "—"}
-                </p>
-                <div className="flex items-center justify-between gap-2">
-                  <span className="truncate font-mono text-[10px] text-muted-foreground">{item.model}</span>
-                  <a
-                    href={item.url}
-                    download
-                    target="_blank"
-                    rel="noreferrer"
-                    className="shrink-0 text-muted-foreground transition-colors hover:text-foreground"
-                    aria-label="download"
-                  >
-                    <Download className="size-3.5" />
-                  </a>
+          {items.map((item) => {
+            // Media can carry an arbitrary upstream URL. Only http(s) and
+            // site-relative links are offered as a download; anything else
+            // renders without one rather than handing the client a
+            // javascript: or data: href.
+            const downloadable = /^https?:/i.test(item.url) || item.url.startsWith("/");
+            return (
+              <article key={item.id} className="overflow-hidden rounded-lg bg-card">
+                <div className="relative aspect-square bg-secondary/60">
+                  {item.kind === "image" ? (
+                    <img src={item.url} alt={item.prompt} loading="lazy" className="size-full object-cover" />
+                  ) : (
+                    <video src={item.url} controls className="size-full object-cover" />
+                  )}
+                  <Badge variant="secondary" className="absolute left-2 top-2 bg-background/85 backdrop-blur">
+                    {item.kind === "image" ? t("models.typeImage") : t("models.typeVideo")}
+                  </Badge>
                 </div>
-                <p className="truncate text-[10px] text-muted-foreground">
-                  {item.accountName || "—"} · {formatDateTime(item.createdAt, i18n.language)}
-                </p>
-              </div>
-            </article>
-          ))}
+                <div className="space-y-2 p-3">
+                  <p className="line-clamp-2 min-h-8 text-[11px] leading-4 text-muted-foreground" title={item.prompt}>
+                    {item.prompt || "—"}
+                  </p>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate font-mono text-[10px] text-muted-foreground">{item.model}</span>
+                    {downloadable ? (
+                      <a
+                        href={item.url}
+                        download
+                        target="_blank"
+                        rel="noreferrer"
+                        className="shrink-0 text-muted-foreground transition-colors hover:text-foreground"
+                        aria-label="download"
+                      >
+                        <Download className="size-3.5" />
+                      </a>
+                    ) : null}
+                  </div>
+                  <p className="truncate text-[10px] text-muted-foreground">
+                    {item.accountName || "—"} · {formatDateTime(item.createdAt, i18n.language)}
+                  </p>
+                </div>
+              </article>
+            );
+          })}
         </div>
       )}
 

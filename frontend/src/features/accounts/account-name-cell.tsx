@@ -112,7 +112,7 @@ export function AccountStatusCell({ account }: { account: AccountDTO }) {
         </Tooltip>
       ) : null}
       {account.failCount > 0 ? (
-        <span className="text-[10px] text-muted-foreground tabular-nums">失败 {account.failCount}</span>
+        <span className="text-[10px] text-muted-foreground tabular-nums">{t("accounts.failCount", { count: account.failCount })}</span>
       ) : null}
     </div>
   );
@@ -178,13 +178,14 @@ export function AccountPlanCell({ account }: { account: AccountDTO }) {
 }
 
 export function AccountRoutingCell({ account }: { account: AccountDTO }) {
+  const { t } = useTranslation();
   return (
     <div className="space-y-0.5 text-[11px] text-muted-foreground">
       <p className="tabular-nums">
-        优先级 <span className="text-foreground">{account.priority}</span>
+        {t("accounts.priority")} <span className="text-foreground">{account.priority}</span>
       </p>
       <p className="tabular-nums">
-        并发 <span className="text-foreground">{account.inflight}</span> / {account.maxConcurrent}
+        {t("accounts.concurrency")} <span className="text-foreground">{account.inflight}</span> / {account.maxConcurrent}
       </p>
     </div>
   );

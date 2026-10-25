@@ -64,6 +64,14 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
       payload && typeof payload === "object" && "code" in payload
         ? String((payload as { code: unknown }).code)
         : "";
+    // A session that expires mid-use should land the operator on the login
+    // page instead of surfacing 401 toasts from every query. The login call
+    // itself answers 401 for a wrong password — that is a message, not a
+    // redirect — and with no stored token there is nothing to clear.
+    if (response.status === 401 && path !== "/admin/api/auth/login" && readToken()) {
+      writeToken("");
+      window.location.assign("/login");
+    }
     throw new ApiError(message, response.status, code);
   }
 

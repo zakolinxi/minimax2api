@@ -1,3 +1,5 @@
+import { useTranslation } from "react-i18next";
+
 import { Select } from "@/components/ui/select";
 
 export const PERIOD_DAYS = [1, 7, 30, 90] as const;
@@ -16,6 +18,7 @@ export function PeriodSelector({
   onChange: (value: PeriodDays) => void;
   ariaLabel?: string;
 }) {
+  const { t } = useTranslation();
   return (
     <Select
       ariaLabel={ariaLabel}
@@ -23,10 +26,10 @@ export function PeriodSelector({
       value={String(value)}
       onChange={(next) => onChange(Number(next) as PeriodDays)}
       options={[
-        { value: "1", label: "最近 24 小时" },
-        { value: "7", label: "最近 7 天" },
-        { value: "30", label: "最近 30 天" },
-        { value: "90", label: "最近 90 天" },
+        { value: "1", label: t("periods.last24h") },
+        { value: "7", label: t("periods.last7d") },
+        { value: "30", label: t("periods.last30d") },
+        { value: "90", label: t("periods.last90d") },
       ]}
     />
   );

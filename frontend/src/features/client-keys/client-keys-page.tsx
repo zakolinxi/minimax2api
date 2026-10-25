@@ -34,6 +34,40 @@ import { PageHeader } from "@/shared/components/page-header";
 import { cn } from "@/shared/lib/cn";
 import { formatDateTime, formatNumber } from "@/shared/lib/format";
 
+/**
+ * Writes to the clipboard, trying the async API first.
+ *
+ * The Clipboard API only exists in secure contexts, so a console deployed over
+ * plain HTTP — a homelab behind a LAN address, most commonly — has no
+ * `navigator.clipboard` at all, and some browsers refuse the write even where
+ * the object exists. The legacy `execCommand` path covers both before the copy
+ * is allowed to fail.
+ */
+async function copyText(value: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    /* fall through to the legacy path */
+  }
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = value;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    return copied;
+  } catch {
+    return false;
+  }
+}
+
 export function ClientKeysPage() {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
@@ -114,14 +148,14 @@ export function ClientKeysPage() {
   }
 
   async function copy(value: string): Promise<void> {
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(value);
-      toast.success(t("common.copied"));
-      window.setTimeout(() => setCopied(null), 1600);
-    } catch {
+    const ok = await copyText(value);
+    if (!ok) {
       toast.error(t("errors.generic"));
+      return;
     }
+    setCopied(value);
+    toast.success(t("common.copied"));
+    window.setTimeout(() => setCopied(null), 1600);
   }
 
   return (
