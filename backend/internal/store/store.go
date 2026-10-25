@@ -30,6 +30,7 @@ const (
 	stateFile     = "app.json"
 	pbkdfRounds   = 120000
 	sessionTTL    = 12 * time.Hour
+	maxSessions   = 512
 	schemaVersion = 1
 )
 
@@ -56,6 +57,13 @@ type Store struct {
 	flush  chan chan error
 	closed chan struct{}
 	wg     sync.WaitGroup
+	// unsaved reports whether the in-memory state may hold changes the disk
+	// has not seen. markDirtyLocked sets it; writeSnapshot clears it just
+	// before reading the state, so any mutation landing during the write
+	// re-sets it. This is what lets the shutdown path tell a lost final write
+	// apart from a completed one, since the dirty channel and the closed
+	// channel give the loop no ordering guarantee.
+	unsaved atomic.Bool
 }
 
 // Open loads (or initialises) the persistent store inside dataDir.
@@ -77,12 +85,31 @@ func Open(dataDir, adminUser, adminPassword string) (*Store, error) {
 	switch {
 	case err == nil:
 		if err := json.Unmarshal(raw, &store.state); err != nil {
+			// The file is unreadable, and the next successful write would
+			// destroy the only copy of every account, key and audit record.
+			// Move it aside first — best effort, the error is returned either
+			// way — so the operator can still recover the raw content; the
+			// next start then finds no file and reinitialises.
+			backup := store.path + fmt.Sprintf(".corrupt-%d", time.Now().UnixNano())
+			if renameErr := os.Rename(store.path, backup); renameErr == nil {
+				return nil, fmt.Errorf("parse %s: %w (damaged file moved to %s)", store.path, err, backup)
+			}
 			return nil, fmt.Errorf("parse %s: %w", store.path, err)
 		}
 	case os.IsNotExist(err):
 		fresh = true
 	default:
 		return nil, fmt.Errorf("read %s: %w", store.path, err)
+	}
+
+	// A file written by a newer build may carry fields this build does not
+	// know. Loading it anyway would drop those fields on the next write, so
+	// refuse instead and leave the file exactly as it is.
+	if store.state.Version > schemaVersion {
+		return nil, fmt.Errorf(
+			"数据文件 %s 由更新版本的程序写入（数据版本 %d，当前支持 %d），拒绝加载以避免字段丢失",
+			store.path, store.state.Version, schemaVersion,
+		)
 	}
 
 	if fresh {
@@ -149,26 +176,49 @@ func (s *Store) loop() {
 			case <-s.dirty:
 			default:
 			}
-			if err := s.writeSnapshot(); err != nil {
-				log.Printf("持久化失败: %v", err)
-			}
+			s.writeSnapshotLogged()
 		case reply := <-s.flush:
 			reply <- s.writeSnapshot()
 		case <-s.closed:
+			// Shutdown has to be a real final flush. Close's non-blocking
+			// flush and this select give the dirty and closed channels no
+			// ordering, so the last change signalled just before Close ran
+			// could otherwise sit unsaved forever. Write it if one is owed.
+			if s.unsaved.Load() {
+				s.writeSnapshotLogged()
+			}
 			return
 		}
 	}
 }
 
+// writeSnapshotLogged wraps writeSnapshot for the background writer, which
+// owns the error rather than returning it to anyone.
+func (s *Store) writeSnapshotLogged() {
+	if err := s.writeSnapshot(); err != nil {
+		log.Printf("持久化失败: %v", err)
+	}
+}
+
 // writeSnapshot marshals under a read lock and performs file I/O outside of it.
 func (s *Store) writeSnapshot() error {
+	// The unsaved flag is cleared before the state is read, not after the file
+	// is written: a mutation landing in between re-sets the flag and re-queues
+	// a write, while clearing it afterwards would swallow a change that arrived
+	// mid-write and leave the shutdown path believing everything is on disk.
+	s.unsaved.Store(false)
 	s.mu.RLock()
 	raw, err := json.MarshalIndent(s.state, "", "  ")
 	s.mu.RUnlock()
 	if err != nil {
+		s.unsaved.Store(true)
 		return err
 	}
-	return writeFileAtomic(s.path, raw)
+	if err := writeFileAtomic(s.path, raw); err != nil {
+		s.unsaved.Store(true)
+		return err
+	}
+	return nil
 }
 
 // writeSnapshotLocked is only used during bootstrap, before the writer starts.
@@ -180,12 +230,47 @@ func (s *Store) writeSnapshotLocked() error {
 	return writeFileAtomic(s.path, raw)
 }
 
+// writeFileAtomic replaces path with raw. The temporary file is flushed to the
+// disk with an explicit Sync before the rename: neither POSIX nor Windows
+// guarantees that rename ordering implies data ordering, so without the sync a
+// power cut between the two steps can leave the state file truncated or stale —
+// and this one file is the only copy of every account, key and audit record.
 func writeFileAtomic(path string, raw []byte) error {
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if _, err := f.Write(raw); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// On Windows a freshly closed file can stay briefly locked by a scanning
+	// antivirus, and the rename then fails with "Access is denied" even though
+	// nothing else holds the handle. Retry a few times before giving up — the
+	// window is short and the state file is not worth a spurious failure.
+	var renameErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		renameErr = os.Rename(tmp, path)
+		if renameErr == nil {
+			break
+		}
+		if !errors.Is(renameErr, os.ErrPermission) {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
+	}
+	if renameErr != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
@@ -216,6 +301,11 @@ func (s *Store) unlockAndNotify() {
 
 // markDirtyLocked schedules a background write. It never blocks.
 func (s *Store) markDirtyLocked() {
+	// The flag rides along because the channel alone cannot answer "is
+	// anything still unsaved": a signal may be sitting unread in the buffer
+	// while the loop is mid-write, and the shutdown path needs to know the
+	// difference (see the closed case in loop).
+	s.unsaved.Store(true)
 	select {
 	case s.dirty <- struct{}{}:
 	default:
@@ -268,10 +358,16 @@ func hashPassword(password, salt string) string {
 	return hex.EncodeToString(sum)
 }
 
+// randomToken returns bytes hex-encoded as a token.
+//
+// crypto/rand failing means the operating system's entropy source is broken.
+// Falling back to a timestamp would silently issue guessable admin passwords,
+// session tokens and API keys, which is strictly worse than not serving at all,
+// so the process fails closed instead.
 func randomToken(bytes int) string {
 	buf := make([]byte, bytes)
 	if _, err := rand.Read(buf); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+		panic(fmt.Sprintf("crypto/rand unavailable, refusing to derive authentication material: %v", err))
 	}
 	return hex.EncodeToString(buf)
 }
@@ -311,6 +407,19 @@ func (s *Store) IssueSession() (string, time.Time) {
 	token := randomToken(24)
 	expires := time.Now().Add(sessionTTL)
 	s.mu.Lock()
+	// Entries only ever leave this map through an explicit revoke or the sweep
+	// below, so it would otherwise grow by one per login for the life of the
+	// process. Past a generous bound, drop every expired entry before adding
+	// another one; live sessions are never touched, so no active login can be
+	// ended by the sweep.
+	if len(s.sessions) > maxSessions {
+		now := time.Now()
+		for old, at := range s.sessions {
+			if now.After(at) {
+				delete(s.sessions, old)
+			}
+		}
+	}
 	s.sessions[token] = expires
 	s.mu.Unlock()
 	return token, expires
@@ -323,10 +432,21 @@ func (s *Store) ValidateSession(token string) bool {
 	s.mu.RLock()
 	expires, ok := s.sessions[token]
 	s.mu.RUnlock()
-	if !ok || time.Now().After(expires) {
+	if !ok {
 		return false
 	}
-	return true
+	if !time.Now().After(expires) {
+		return true
+	}
+	// The entry is dead; drop it here so the map does not keep every token a
+	// browser ever presented until the process exits. Re-check under the write
+	// lock in case the map changed in between.
+	s.mu.Lock()
+	if at, still := s.sessions[token]; still && time.Now().After(at) {
+		delete(s.sessions, token)
+	}
+	s.mu.Unlock()
+	return false
 }
 
 func (s *Store) RevokeSession(token string) {
@@ -357,17 +477,31 @@ func (s *Store) Settings() config.Settings {
 }
 
 func (s *Store) UpdateSettings(apply func(*config.Settings)) error {
+	// Build the candidate from a copy of the live settings. Settings is a flat
+	// struct of strings, ints and bools with no reference fields, so a plain
+	// value copy is a deep copy. Working on the copy means a failure below
+	// cannot leave the live state, the published snapshot and the file
+	// disagreeing about what the configuration is.
 	s.mu.Lock()
-	apply(&s.state.Settings)
-	s.state.Settings.Normalize(s.dataDir)
-	snapshot := s.state.Settings
-	if err := os.MkdirAll(snapshot.Media.GeneratedDir, 0o755); err != nil {
-		s.mu.Unlock()
+	candidate := s.state.Settings
+	s.mu.Unlock()
+
+	apply(&candidate)
+	candidate.Normalize(s.dataDir)
+
+	// The directory creation is real I/O and stays out of the write lock, as
+	// the comment on Store demands. It also runs before the commit: a failure
+	// here returns with the state untouched instead of leaving memory changed
+	// while the snapshot and the file never learn about it.
+	if err := os.MkdirAll(candidate.Media.GeneratedDir, 0o755); err != nil {
 		return err
 	}
+
+	s.mu.Lock()
+	s.state.Settings = candidate
 	s.markDirtyLocked()
 	// Publish inside the lock so a callback reading settings sees the new value.
-	s.settings.Store(snapshot)
+	s.settings.Store(candidate)
 	defer s.unlockAndNotify()
 	return nil
 }
@@ -483,7 +617,11 @@ func (s *Store) AddAccount(account *Account) error {
 	now := time.Now()
 	account.CreatedAt = now
 	account.UpdatedAt = now
-	s.state.Accounts = append(s.state.Accounts, account)
+	// The defaults applied above stay on the caller's object (the console reads
+	// account.ID right after this returns), but the store keeps its own copy:
+	// aliasing the caller's pointers would let anything they do afterwards race
+	// with the pool mutating accounts under the lock.
+	s.state.Accounts = append(s.state.Accounts, account.clone())
 	s.markDirtyLocked()
 	return nil
 }
@@ -503,7 +641,8 @@ func (s *Store) UpdateAccount(id string, apply func(*Account)) (*Account, error)
 			account.Status = StatusActive
 		}
 		s.markDirtyLocked()
-		return account, nil
+		// A detached snapshot, like every other read path hands out.
+		return account.clone(), nil
 	}
 	return nil, ErrNotFound
 }
@@ -609,10 +748,11 @@ func (s *Store) SaveAccountState(id string, apply func(*Account)) {
 	for _, account := range s.state.Accounts {
 		if account.ID == id {
 			apply(account)
-			break
+			s.markDirtyLocked()
+			return
 		}
 	}
-	s.markDirtyLocked()
+	// An unknown id changes nothing, so it must not schedule a write either.
 }
 
 func (s *Store) AccountGroups() []string {
@@ -636,11 +776,26 @@ func (s *Store) AccountGroups() []string {
 
 // --------------------------------------------------------------- client keys
 
+// clone returns a detached copy of a client key.
+//
+// The store owns the live keys and mutates them in place under s.mu, so every
+// pointer handed out must be a copy; ClientKey holds only value types, which
+// makes a plain struct copy a deep copy.
+func (k *ClientKey) clone() *ClientKey {
+	if k == nil {
+		return nil
+	}
+	out := *k
+	return &out
+}
+
 func (s *Store) ListClientKeys() []*ClientKey {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*ClientKey, len(s.state.ClientKeys))
-	copy(out, s.state.ClientKeys)
+	for index, key := range s.state.ClientKeys {
+		out[index] = key.clone()
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out
 }
@@ -650,7 +805,7 @@ func (s *Store) ClientKeyByValue(value string) (*ClientKey, bool) {
 	defer s.mu.RUnlock()
 	for _, key := range s.state.ClientKeys {
 		if key.Key == value {
-			return key, true
+			return key.clone(), true
 		}
 	}
 	return nil, false
@@ -670,7 +825,8 @@ func (s *Store) CreateClientKey(name string, rpm, maxConcurrent int) (*ClientKey
 	}
 	s.state.ClientKeys = append(s.state.ClientKeys, key)
 	s.markDirtyLocked()
-	return key, nil
+	// Hand back a copy so the caller cannot race with BumpClientKeyUsage.
+	return key.clone(), nil
 }
 
 func (s *Store) UpdateClientKey(id string, apply func(*ClientKey)) (*ClientKey, error) {
@@ -682,7 +838,7 @@ func (s *Store) UpdateClientKey(id string, apply func(*ClientKey)) (*ClientKey, 
 		}
 		apply(key)
 		s.markDirtyLocked()
-		return key, nil
+		return key.clone(), nil
 	}
 	return nil, ErrNotFound
 }
@@ -702,13 +858,16 @@ func (s *Store) DeleteClientKey(id string) error {
 }
 
 // BumpClientKeyUsage records usage without forcing a synchronous disk write on
-// the request path.
+// the request path. The change is still queued for the debounced background
+// write — markDirtyLocked never blocks — so counters survive a crash instead of
+// silently rewinding to whatever flush last happened to follow them.
 func (s *Store) BumpClientKeyUsage(id string) {
 	s.mu.Lock()
 	for _, key := range s.state.ClientKeys {
 		if key.ID == id {
 			key.TotalRequests++
 			key.LastUsedAt = time.Now()
+			s.markDirtyLocked()
 			break
 		}
 	}
@@ -717,11 +876,32 @@ func (s *Store) BumpClientKeyUsage(id string) {
 
 // -------------------------------------------------------------------- models
 
+// clone returns a detached copy of a model entry.
+//
+// The four generation-option fields are slices, so a plain struct copy would
+// leave the copy sharing its backing arrays with the store's own entry: a
+// caller writing through the copy would scribble over the live catalogue
+// without holding the lock. Each slice is copied; a nil source stays nil,
+// which the merge and the gateway read as "unconstrained".
+func (m *ModelConfig) clone() *ModelConfig {
+	if m == nil {
+		return nil
+	}
+	out := *m
+	out.Ratios = append([]string(nil), m.Ratios...)
+	out.Resolutions = append([]string(nil), m.Resolutions...)
+	out.Durations = append([]int(nil), m.Durations...)
+	out.ContextWindows = append([]int(nil), m.ContextWindows...)
+	return &out
+}
+
 func (s *Store) ListModels() []*ModelConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*ModelConfig, len(s.state.Models))
-	copy(out, s.state.Models)
+	for index, model := range s.state.Models {
+		out[index] = model.clone()
+	}
 	return out
 }
 
@@ -730,7 +910,10 @@ func (s *Store) ModelByID(id string) (*ModelConfig, bool) {
 	defer s.mu.RUnlock()
 	for _, model := range s.state.Models {
 		if model.ID == id {
-			return model, true
+			// A detached snapshot: RecordModelUsage mutates the live entry's
+			// counters while gateway requests hold this value for their whole
+			// duration.
+			return model.clone(), true
 		}
 	}
 	return nil, false
@@ -745,18 +928,21 @@ func (s *Store) UpdateModel(id string, apply func(*ModelConfig)) (*ModelConfig, 
 		}
 		apply(model)
 		s.markDirtyLocked()
-		return model, nil
+		// A detached snapshot, like ListModels hands out.
+		return model.clone(), nil
 	}
 	return nil, ErrNotFound
 }
 
-// RecordModelUsage accumulates per-model counters.
+// RecordModelUsage accumulates per-model counters. Like BumpClientKeyUsage it
+// queues a debounced write rather than touching the disk on the request path.
 func (s *Store) RecordModelUsage(id string, requests, tokens int64) {
 	s.mu.Lock()
 	for _, model := range s.state.Models {
 		if model.ID == id {
 			model.Requests += requests
 			model.Tokens += tokens
+			s.markDirtyLocked()
 			break
 		}
 	}
@@ -772,6 +958,9 @@ func (s *Store) AppendAudit(audit *Audit) {
 	if len(s.state.Audits) > settings.Audit.MaxRecords {
 		s.state.Audits = s.state.Audits[:settings.Audit.MaxRecords]
 	}
+	// The record must reach the disk: without a write queued here a crash
+	// loses every audit since the last unrelated flush.
+	s.markDirtyLocked()
 	s.mu.Unlock()
 }
 
@@ -779,7 +968,10 @@ func (s *Store) ListAudits() []*Audit {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*Audit, len(s.state.Audits))
-	copy(out, s.state.Audits)
+	for index, audit := range s.state.Audits {
+		copied := *audit
+		out[index] = &copied
+	}
 	return out
 }
 
@@ -788,7 +980,8 @@ func (s *Store) AuditByID(id string) (*Audit, bool) {
 	defer s.mu.RUnlock()
 	for _, audit := range s.state.Audits {
 		if audit.ID == id {
-			return audit, true
+			copied := *audit
+			return &copied, true
 		}
 	}
 	return nil, false
@@ -816,7 +1009,13 @@ func (s *Store) PurgeAudits() {
 			kept = append(kept, audit)
 		}
 	}
-	s.state.Audits = kept
+	if len(kept) != len(s.state.Audits) {
+		s.state.Audits = kept
+		// The drop has to reach the disk: a purge that only edited memory
+		// resurrects the records on the next restart, because the file still
+		// describes them.
+		s.markDirtyLocked()
+	}
 	s.mu.Unlock()
 }
 
@@ -828,6 +1027,8 @@ func (s *Store) AddMedia(item *MediaItem) {
 	if len(s.state.Media) > 500 {
 		s.state.Media = s.state.Media[:500]
 	}
+	// Queue the write so a finished generation is not forgotten by a crash.
+	s.markDirtyLocked()
 	s.mu.Unlock()
 }
 
@@ -835,6 +1036,9 @@ func (s *Store) ListMedia() []*MediaItem {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*MediaItem, len(s.state.Media))
-	copy(out, s.state.Media)
+	for index, item := range s.state.Media {
+		copied := *item
+		out[index] = &copied
+	}
 	return out
 }
