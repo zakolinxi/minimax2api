@@ -41,3 +41,31 @@ func TestLimiterEnforcesPositiveConcurrency(t *testing.T) {
 		t.Fatalf("acquire after release: %v", err)
 	}
 }
+
+// A request refused for concurrency must not burn a request-per-minute slot.
+// The other order let a key pinned at its ceiling spend its whole RPM budget
+// on its own 429s.
+func TestLimiterConcurrencyRejectionDoesNotBurnRPM(t *testing.T) {
+	l := newLimiter()
+	key := &store.ClientKey{ID: "k", RPMLimit: 2, MaxConcurrent: 1}
+
+	if err := l.acquire(key); err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	if err := l.acquire(key); err == nil {
+		t.Fatal("second acquire over the concurrency ceiling should fail")
+	}
+	l.release(key)
+
+	// The RPM window holds only the one request that actually ran: the
+	// concurrency 429 counted for nothing. This acquire is the second real
+	// request and fits the budget of two.
+	if err := l.acquire(key); err != nil {
+		t.Fatalf("acquire after the slot freed: %v — the concurrency rejection must not have charged RPM", err)
+	}
+	// Now the RPM window is genuinely spent: three requests against a budget
+	// of two, only two of which ever ran.
+	if err := l.acquire(key); err == nil {
+		t.Fatal("third acquire within the same minute should hit the RPM limit")
+	}
+}

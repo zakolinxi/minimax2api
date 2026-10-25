@@ -270,3 +270,89 @@ func TestFilePartFieldsParseThroughContent(t *testing.T) {
 		t.Errorf("urls = %v, files = %v — image parsing must be untouched", urls, files)
 	}
 }
+
+// The file registry must not let one key list, read or delete another key's
+// uploads. The not-found answer is deliberately the same for "missing" and
+// "not yours".
+func TestFilesAreScopedToTheirKey(t *testing.T) {
+	h, _, _ := newFileHarness(t)
+	other, err := h.store.CreateClientKey("other-key", 0, 0)
+	if err != nil {
+		t.Fatalf("create second key: %v", err)
+	}
+
+	uploaded := uploadFile(t, h, "a.txt", "hello")
+	id := uploaded["id"].(string)
+
+	get := func(path, token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		switch {
+		case strings.HasSuffix(path, "/content"):
+			h.gateway.FilesContent(rec, req)
+		default:
+			h.gateway.FilesList(rec, req)
+		}
+		return rec
+	}
+
+	// Another key's listing does not include the file.
+	listed := get("/v1/files", other.Key)
+	var payload struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(listed.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("list not JSON: %v", err)
+	}
+	for _, item := range payload.Data {
+		if item["id"] == id {
+			t.Fatal("another key can see the file in its listing")
+		}
+	}
+
+	// Its own listing does.
+	own := get("/v1/files", h.key)
+	payload.Data = nil
+	if err := json.Unmarshal(own.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("list not JSON: %v", err)
+	}
+	found := false
+	for _, item := range payload.Data {
+		if item["id"] == id {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the owning key cannot see its own file")
+	}
+
+	// Content and delete are refused the same way for the other key.
+	req := httptest.NewRequest(http.MethodGet, "/v1/files/"+id+"/content", nil)
+	req.SetPathValue("id", id)
+	req.Header.Set("authorization", "Bearer "+other.Key)
+	rec := httptest.NewRecorder()
+	h.gateway.FilesContent(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-key content = HTTP %d, want 404", rec.Code)
+	}
+
+	del := httptest.NewRequest(http.MethodDelete, "/v1/files/"+id, nil)
+	del.SetPathValue("id", id)
+	del.Header.Set("authorization", "Bearer "+other.Key)
+	rec = httptest.NewRecorder()
+	h.gateway.FilesDelete(rec, del)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-key delete = HTTP %d, want 404", rec.Code)
+	}
+
+	// The owner can still delete its own file.
+	del = httptest.NewRequest(http.MethodDelete, "/v1/files/"+id, nil)
+	del.SetPathValue("id", id)
+	del.Header.Set("authorization", "Bearer "+h.key)
+	rec = httptest.NewRecorder()
+	h.gateway.FilesDelete(rec, del)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("own delete = HTTP %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+}

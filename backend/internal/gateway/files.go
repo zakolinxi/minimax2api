@@ -38,6 +38,12 @@ type fileRecord struct {
 	MimeType  string    `json:"mime_type"`
 	Size      int64     `json:"size"`
 	CreatedAt time.Time `json:"created_at"`
+	// OwnerKey is the client key that uploaded the file. The registry used to
+	// be one shared pool — any key could list, read and delete every other
+	// key's uploads — which made a leaked key a destructor for files it never
+	// owned. An empty OwnerKey is a record written before the field existed;
+	// those stay visible to every key rather than vanishing after an upgrade.
+	OwnerKey string `json:"owner_key,omitempty"`
 }
 
 // fileStore keeps uploaded files on disk with a JSON index beside them.
@@ -96,8 +102,8 @@ func (s *fileStore) persistLocked() error {
 	return os.Rename(tmp, s.indexPath())
 }
 
-// put stores the bytes under a fresh id and registers it.
-func (s *fileStore) put(filename, purpose, mimeType string, data []byte) (fileRecord, error) {
+// put stores the bytes under a fresh id and registers it against owner.
+func (s *fileStore) put(filename, purpose, mimeType string, data []byte, owner string) (fileRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
@@ -110,6 +116,7 @@ func (s *fileStore) put(filename, purpose, mimeType string, data []byte) (fileRe
 		MimeType:  mimeType,
 		Size:      int64(len(data)),
 		CreatedAt: time.Now(),
+		OwnerKey:  owner,
 	}
 	if err := os.WriteFile(filepath.Join(s.dir, record.ID), data, 0o644); err != nil {
 		return fileRecord{}, err
@@ -130,11 +137,16 @@ func (s *fileStore) get(id string) (fileRecord, bool) {
 	return record, ok
 }
 
-func (s *fileStore) list() []fileRecord {
+// list returns the records one key may see: its own uploads, plus the
+// owner-less records left over from before uploads were owned.
+func (s *fileStore) list(owner string) []fileRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	records := make([]fileRecord, 0, len(s.records))
 	for _, record := range s.records {
+		if record.OwnerKey != "" && record.OwnerKey != owner {
+			continue
+		}
 		records = append(records, record)
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].CreatedAt.Before(records[j].CreatedAt) })
@@ -144,12 +156,15 @@ func (s *fileStore) list() []fileRecord {
 func (s *fileStore) delete(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.records[id]; !ok {
+	record, ok := s.records[id]
+	if !ok {
 		return false
 	}
 	delete(s.records, id)
 	if err := s.persistLocked(); err != nil {
-		s.records[id] = fileRecord{ID: id}
+		// Put the whole record back — restoring a bare {id} shell would leave
+		// the file registered with its name, size and timestamp gone.
+		s.records[id] = record
 		return false
 	}
 	_ = os.Remove(filepath.Join(s.dir, id))
@@ -177,7 +192,10 @@ func uploadsDir(generatedDir string) string {
 	return filepath.Join(filepath.Dir(generatedDir), "uploads")
 }
 
-// filesHandler guards the file endpoints behind the same keys as chat.
+// filesHandler guards the file endpoints behind the same keys — and the same
+// rate and concurrency limiter — as chat. Uploads are the expensive direction,
+// so leaving them outside the limiter would let one key do unlimited work on
+// the two endpoints that can cost the most per request.
 func (g *Gateway) filesHandler(w http.ResponseWriter, r *http.Request, action func(http.ResponseWriter, *http.Request, *store.ClientKey)) {
 	out := &respWriter{ResponseWriter: w}
 	key, err := g.authenticate(r)
@@ -185,6 +203,11 @@ func (g *Gateway) filesHandler(w http.ResponseWriter, r *http.Request, action fu
 		writeError(out, http.StatusUnauthorized, err.Error())
 		return
 	}
+	if err := g.limiter.acquire(key); err != nil {
+		writeError(out, http.StatusTooManyRequests, err.Error())
+		return
+	}
+	defer g.limiter.release(key)
 	action(out, r, key)
 }
 
@@ -193,7 +216,7 @@ func (g *Gateway) FilesUpload(w http.ResponseWriter, r *http.Request) {
 	g.filesHandler(w, r, g.filesUpload)
 }
 
-func (g *Gateway) filesUpload(out http.ResponseWriter, r *http.Request, _ *store.ClientKey) {
+func (g *Gateway) filesUpload(out http.ResponseWriter, r *http.Request, key *store.ClientKey) {
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
 		writeError(out, http.StatusBadRequest, "invalid multipart form: "+err.Error())
 		return
@@ -241,7 +264,7 @@ func (g *Gateway) filesUpload(out http.ResponseWriter, r *http.Request, _ *store
 	}
 
 	store := g.filesStore()
-	record, err := store.put(header.Filename, purpose, mimeType, data)
+	record, err := store.put(header.Filename, purpose, mimeType, data, key.ID)
 	if err != nil {
 		writeError(out, http.StatusInternalServerError, "cannot store upload: "+err.Error())
 		return
@@ -251,8 +274,8 @@ func (g *Gateway) filesUpload(out http.ResponseWriter, r *http.Request, _ *store
 
 // FilesList implements GET /v1/files.
 func (g *Gateway) FilesList(w http.ResponseWriter, r *http.Request) {
-	g.filesHandler(w, r, func(out http.ResponseWriter, _ *http.Request, _ *store.ClientKey) {
-		records := g.filesStore().list()
+	g.filesHandler(w, r, func(out http.ResponseWriter, _ *http.Request, key *store.ClientKey) {
+		records := g.filesStore().list(key.ID)
 		items := make([]any, 0, len(records))
 		for _, record := range records {
 			items = append(items, fileObject(record))
@@ -267,8 +290,8 @@ func (g *Gateway) FilesList(w http.ResponseWriter, r *http.Request) {
 
 // FilesRetrieve implements GET /v1/files/{id}.
 func (g *Gateway) FilesRetrieve(w http.ResponseWriter, r *http.Request) {
-	g.filesHandler(w, r, func(out http.ResponseWriter, r *http.Request, _ *store.ClientKey) {
-		record, ok := g.filesStore().get(r.PathValue("id"))
+	g.filesHandler(w, r, func(out http.ResponseWriter, r *http.Request, key *store.ClientKey) {
+		record, ok := g.ownedFile(r.PathValue("id"), key)
 		if !ok {
 			writeError(out, http.StatusNotFound, "no such file")
 			return
@@ -279,9 +302,9 @@ func (g *Gateway) FilesRetrieve(w http.ResponseWriter, r *http.Request) {
 
 // FilesContent implements GET /v1/files/{id}/content.
 func (g *Gateway) FilesContent(w http.ResponseWriter, r *http.Request) {
-	g.filesHandler(w, r, func(out http.ResponseWriter, r *http.Request, _ *store.ClientKey) {
+	g.filesHandler(w, r, func(out http.ResponseWriter, r *http.Request, key *store.ClientKey) {
 		store := g.filesStore()
-		record, ok := store.get(r.PathValue("id"))
+		record, ok := g.ownedFile(r.PathValue("id"), key)
 		if !ok {
 			writeError(out, http.StatusNotFound, "no such file")
 			return
@@ -301,14 +324,34 @@ func (g *Gateway) FilesContent(w http.ResponseWriter, r *http.Request) {
 
 // FilesDelete implements DELETE /v1/files/{id}.
 func (g *Gateway) FilesDelete(w http.ResponseWriter, r *http.Request) {
-	g.filesHandler(w, r, func(out http.ResponseWriter, r *http.Request, _ *store.ClientKey) {
+	g.filesHandler(w, r, func(out http.ResponseWriter, r *http.Request, key *store.ClientKey) {
 		id := r.PathValue("id")
-		if !g.filesStore().delete(id) {
+		record, ok := g.ownedFile(id, key)
+		if !ok {
 			writeError(out, http.StatusNotFound, "no such file")
+			return
+		}
+		if !g.filesStore().delete(record.ID) {
+			writeError(out, http.StatusInternalServerError, "cannot delete file")
 			return
 		}
 		writeJSON(out, http.StatusOK, map[string]any{"id": id, "object": "file", "deleted": true})
 	})
+}
+
+// ownedFile looks a file up on behalf of a key and refuses the records another
+// key owns. The not-found answer is deliberately indistinguishable for "does
+// not exist" and "not yours" — a 404 keeps the registry from confirming
+// guesses about other keys' ids.
+func (g *Gateway) ownedFile(id string, key *store.ClientKey) (fileRecord, bool) {
+	record, ok := g.filesStore().get(id)
+	if !ok {
+		return fileRecord{}, false
+	}
+	if record.OwnerKey != "" && record.OwnerKey != key.ID {
+		return fileRecord{}, false
+	}
+	return record, true
 }
 
 // resolveFilePart turns an OpenAI file content part into a turn attachment.
