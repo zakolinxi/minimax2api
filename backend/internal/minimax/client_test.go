@@ -3,6 +3,8 @@ package minimax
 import (
 	"encoding/base64"
 	"errors"
+	"io"
+	"minimax2api/internal/config"
 	"strings"
 	"testing"
 	"time"
@@ -418,5 +420,42 @@ func TestHandleFrameStillReadsUnknownShapes(t *testing.T) {
 	}
 	if result.Text != "新形状" {
 		t.Fatalf("text = %q, want the tolerant path to keep reading it", result.Text)
+	}
+}
+
+// A CRLF-framed stream used to fail to frame entirely: "\r\n\r\n" contains no
+// "\n\n" substring, so the whole body fell through to the tail handler as one
+// frame and the answer disappeared without an error.
+func TestConsumeStreamFramesCRLF(t *testing.T) {
+	c := &Client{settings: func() config.Settings {
+		return config.DefaultSettings(t.TempDir())
+	}}
+
+	lf := "data:" + `{"type":6,"agent_message_chunk":{"msg_content":"回答"}}` + "\n\n" +
+		`data:{"type":9,"finish_reason":"stop"}` + "\n\n"
+	crlf := strings.ReplaceAll(lf, "\n", "\r\n")
+
+	var deltas []string
+	opts := Options{OnDelta: func(text string) { deltas = append(deltas, text) }}
+	result := &Result{}
+	if err := c.consumeStream(io.NopCloser(strings.NewReader(crlf)), opts, result); err != nil {
+		t.Fatalf("consumeStream: %v", err)
+	}
+	if result.Text != "回答" {
+		t.Fatalf("text = %q, want the CRLF-framed answer", result.Text)
+	}
+	if len(deltas) == 0 {
+		t.Fatal("no delta reached the callback")
+	}
+
+	// Mixed endings (a proxy rewriting some lines) frame just as well.
+	mixed := "data:" + `{"type":6,"agent_message_chunk":{"msg_content":"混合"}}` + "\r\n\n" +
+		`data:{"type":9,"finish_reason":"stop"}` + "\n\r\n"
+	result2 := &Result{}
+	if err := c.consumeStream(io.NopCloser(strings.NewReader(mixed)), opts, result2); err != nil {
+		t.Fatalf("consumeStream mixed: %v", err)
+	}
+	if result2.Text != "混合" {
+		t.Fatalf("mixed text = %q", result2.Text)
 	}
 }

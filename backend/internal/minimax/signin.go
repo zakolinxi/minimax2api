@@ -216,7 +216,7 @@ func formEncode(value string) string {
 // plus query, never the absolute URL: axios keeps baseURL separate from url, so
 // the signature sees only "/minimax-cloud/api/v1/signin/status?...".
 func (c *Client) signinRequest(ctx context.Context, settings config.Settings, cred Credential, method, path, body string) (*http.Request, error) {
-	now := time.Now()
+	now := c.clock()
 	signedPath := path + "?" + signinParams(settings, cred, now.UnixMilli(), true)
 	wirePath := path + "?" + signinParams(settings, cred, now.UnixMilli(), false)
 

@@ -11,6 +11,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -99,9 +100,19 @@ func (c *uploadCache) put(key, objectKey string) {
 		c.byKey = make(map[string]string)
 	}
 	if len(c.byKey) >= uploadCacheLimit {
-		// Crude but bounded: a full cache is evidence of a pathological caller,
-		// not of value worth evicting one entry at a time.
-		c.byKey = make(map[string]string)
+		// Bounded by dropping the older half. Clearing the map wholesale made a
+		// full cache lose every entry at once, so a caller with many distinct
+		// files re-uploaded everything every uploadCacheLimit uploads. Map
+		// iteration order is random, so "half" is approximate — good enough,
+		// because the only cost of dropping a live entry is one re-upload.
+		dropped := 0
+		for existing := range c.byKey {
+			if dropped >= uploadCacheLimit/2 {
+				break
+			}
+			delete(c.byKey, existing)
+			dropped++
+		}
 	}
 	c.byKey[key] = objectKey
 }
@@ -176,6 +187,13 @@ func (c *Client) prepareUpload(ctx context.Context, cred Credential, settings co
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
+		// Same rule as the session and message paths: a 4xx that describes the
+		// request — a file too large, a mime the policy forbids — is a refusal,
+		// not an account fault. As a bare error it retried the identical upload
+		// on the next account and charged each of them a cooldown.
+		if rejectsRequest(resp.StatusCode) {
+			return nil, &UpstreamRejection{Prefix: "upload prepare", Status: resp.StatusCode, Body: snippet(raw)}
+		}
 		return nil, fmt.Errorf("minimax upload prepare HTTP %d: %s", resp.StatusCode, snippet(raw))
 	}
 
@@ -261,7 +279,11 @@ func (c *Client) postToObjectStore(ctx context.Context, settings config.Settings
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
+	// 204 is what the captured request saw, but S3-compatible stores answer
+	// POST form uploads with 200 or 201 just as validly. Anything in the 2xx
+	// range means the object landed; insisting on one status would fail every
+	// upload against such a store — and charge the account for it.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return fmt.Errorf("minimax object upload HTTP %d: %s", resp.StatusCode, snippet(body))
 	}
@@ -290,16 +312,48 @@ func orderedFormFields(raw json.RawMessage) ([]formField, error) {
 		if !ok {
 			return nil, errors.New("form_fields has a non-string key")
 		}
-		var value string
+		// Decode as any rather than string: a policy that carries a numeric
+		// or boolean field — `success_action_status": 200` is a common OSS
+		// one — failed the whole upload when decoded into a string.
+		var value any
 		if err := dec.Decode(&value); err != nil {
 			return nil, fmt.Errorf("field %q: %w", key, err)
 		}
-		fields = append(fields, formField{Key: key, Value: value})
+		fields = append(fields, formField{Key: key, Value: formFieldValue(value)})
 	}
 	if _, err := dec.Token(); err != nil {
 		return nil, err
 	}
 	return fields, nil
+}
+
+// formFieldValue renders a decoded JSON scalar the way it would appear in a
+// multipart form. Objects and arrays have no form representation; they name a
+// policy this uploader cannot honour, and returning them as raw JSON keeps the
+// failure at the object store instead of hiding it here.
+func formFieldValue(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	case float64:
+		if typed == float64(int64(typed)) {
+			return strconv.FormatInt(int64(typed), 10)
+		}
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	default:
+		raw, err := json.Marshal(typed)
+		if err != nil {
+			return fmt.Sprintf("%v", typed)
+		}
+		return string(raw)
+	}
 }
 
 func uploadPreparePath(settings config.Settings) string {

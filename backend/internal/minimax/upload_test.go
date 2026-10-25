@@ -3,11 +3,14 @@ package minimax
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -319,5 +322,67 @@ func TestBuildMessageBodySendsSpaceForFileOnlyTurn(t *testing.T) {
 	}, "turn-1")
 	if imageOnly["content"] != " " {
 		t.Errorf("image-only content = %q, want a single space", imageOnly["content"])
+	}
+}
+
+// A 4xx from the prepare step describes the request — file too large, mime the
+// policy forbids — and must be classified as a refusal. As a bare error it
+// retried the identical upload on the next account and charged each of them a
+// cooldown.
+func TestUploadPrepareRejectsAreClassified(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte(`{"base_resp":{"status_code":2001,"status_msg":"file too large"}}`))
+	}))
+	defer server.Close()
+
+	c := &Client{settings: func() config.Settings {
+		settings := config.DefaultSettings(t.TempDir())
+		settings.Upstream.BaseURL = server.URL
+		return settings
+	}}
+
+	att := &PendingAttachment{Name: "big.bin", MimeType: "application/octet-stream", Data: []byte("x")}
+	err := c.UploadAttachment(context.Background(), Credential{Token: "tok", UserID: "1", AgentID: "a", UUID: "u", DeviceID: "d"}, att)
+	if !errors.Is(err, ErrUpstreamRejected) {
+		t.Fatalf("err = %v, want ErrUpstreamRejected", err)
+	}
+	var rejection *UpstreamRejection
+	if !errors.As(err, &rejection) || rejection.Status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("rejection = %v, want status 413", err)
+	}
+}
+
+// Object stores answer POST form uploads with 200 as often as 204; both mean
+// the object landed. Insisting on one status failed every upload against such
+// a store — and charged the account for it.
+func TestObjectStoreAcceptsAnySuccessStatus(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusCreated, http.StatusNoContent} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			serverURL := ""
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/uploads/prepare") {
+					w.Header().Set("content-type", "application/json")
+					fmt.Fprintf(w, `{"base_resp":{"status_code":0},"object_key":"k","upload_instruction":{"method":"POST","url":"%s/oss","form_fields":{"key":"k"}}}`, serverURL)
+					return
+				}
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+			serverURL = server.URL
+
+			c := &Client{settings: func() config.Settings {
+				settings := config.DefaultSettings(t.TempDir())
+				settings.Upstream.BaseURL = server.URL
+				return settings
+			}}
+			att := &PendingAttachment{Name: "f.bin", MimeType: "application/octet-stream", Data: []byte("x")}
+			if err := c.UploadAttachment(context.Background(), Credential{Token: "tok", UserID: "1", AgentID: "a", UUID: "u", DeviceID: "d"}, att); err != nil {
+				t.Fatalf("upload against HTTP %d: %v", status, err)
+			}
+			if att.ObjectKey == "" {
+				t.Fatal("object key missing")
+			}
+		})
 	}
 }

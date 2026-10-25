@@ -56,6 +56,25 @@ type Settings struct {
 	Media    MediaSettings    `json:"media"`
 	Signin   SigninSettings   `json:"signin"`
 	Video    VideoSettings    `json:"video"`
+	Security SecuritySettings `json:"security"`
+}
+
+// SecuritySettings collects the two switches that trade convenience for
+// exposure. Both default to the safe side; turning one on is a statement about
+// where the gateway is deployed, so neither has a console toggle — they are
+// app.json fields for the operator.
+type SecuritySettings struct {
+	// AllowPrivateFetch lets reference-image downloads target loopback and
+	// private network addresses. Off by default: a client key can make the
+	// gateway fetch arbitrary URLs, and without this switch those URLs are
+	// refused the moment they resolve into loopback, private or link-local
+	// space. Turn it on only for a deployment where the keys are trusted to
+	// sweep the intranet the gateway sits in (local development, tests).
+	AllowPrivateFetch bool `json:"allowPrivateFetch"`
+	// TrustProxy makes audit records credit X-Forwarded-For for the client IP.
+	// On without a trusted reverse proxy in front, any caller can forge the IP
+	// its audit rows carry.
+	TrustProxy bool `json:"trustProxy"`
 }
 
 // VideoSettings drives the video-generation route.
