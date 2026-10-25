@@ -145,8 +145,11 @@ func (a *API) pollBrowserLogin(w http.ResponseWriter, r *http.Request) {
 	info, verifyErr := a.client.FetchUserInfo(probeCtx, minimax.Credential{Token: status.Token})
 	if verifyErr != nil || info == nil || info.RealUserID == "" {
 		// Ask the bridge to close the window: the operator has no further use for
-		// a session whose token the gateway cannot use.
-		_ = a.bridgeJSON(context.Background(), http.MethodDelete, "/login/"+url.PathEscape(id), nil, nil)
+		// a session whose token the gateway cannot use. The call runs on its own
+		// budget — a hung bridge must not hold the request open indefinitely.
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), browserLoginStatusTimeout)
+		defer closeCancel()
+		_ = a.bridgeJSON(closeCtx, http.MethodDelete, "/login/"+url.PathEscape(id), nil, nil)
 		writeError(w, http.StatusBadGateway, "登录令牌无效，无法通过上游校验")
 		return
 	}
@@ -170,7 +173,7 @@ func (a *API) pollBrowserLogin(w http.ResponseWriter, r *http.Request) {
 
 	// The account is usable as soon as it is stored; the upstream probe can take
 	// a while, so it runs in the background like it does for a pasted account.
-	go a.syncQuotaDetached(account.ID)
+	a.goSyncQuotaDetached(account.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account": a.view(account.ID)})
 }
 

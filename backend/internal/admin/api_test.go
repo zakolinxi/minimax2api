@@ -1,8 +1,10 @@
 package admin
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"regexp"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"minimax2api/internal/config"
+	"minimax2api/internal/pool"
 	"minimax2api/internal/store"
 )
 
@@ -443,5 +446,343 @@ func TestConcurrencyLimitKeepsZeroAsUnlimited(t *testing.T) {
 				t.Fatalf("concurrencyLimit(%d) = %d, want %d", tc.value, got, tc.want)
 			}
 		})
+	}
+}
+
+// --- handlers over a live store ----------------------------------------------
+
+// newTestAPI builds an API over a fresh store with a live pool: the minimum
+// the listing, login and dashboard handlers touch. The client and signin
+// service stay nil because none of these tests reach the upstream.
+func newTestAPI(t *testing.T) (*API, *store.Store) {
+	t.Helper()
+	st, err := store.Open(t.TempDir(), "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	dir := t.TempDir()
+	settings := func() config.Settings { return config.DefaultSettings(dir) }
+	api := New(st, pool.New(st, settings), nil, nil, settings, "")
+	return api, st
+}
+
+// addAccount stores one built account, failing the test on the way.
+func addAccount(t *testing.T, st *store.Store, claims map[string]any, region string) *store.Account {
+	t.Helper()
+	account, err := buildAccount(accountPayload{Token: unsignedToken(t, claims), Region: region})
+	if err != nil {
+		t.Fatalf("buildAccount: %v", err)
+	}
+	if err := st.AddAccount(account); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	return account
+}
+
+// TestListPagesTolerateHugePageValues pins the pagination overflow fix. A page
+// of math.MaxInt used to make (page-1)*pageSize wrap negative, slip past the
+// start>total guard and panic slicing a slice with negative bounds.
+func TestListPagesTolerateHugePageValues(t *testing.T) {
+	api, st := newTestAPI(t)
+	for i := 1; i <= 3; i++ {
+		addAccount(t, st, map[string]any{"user_id": strconv.Itoa(i), "phone": "+8613800138000"}, "")
+	}
+	// The audits listing filters the same way, so give it records to page over.
+	for i := 0; i < 3; i++ {
+		st.AppendAudit(&store.Audit{ID: "req_" + strconv.Itoa(i), CreatedAt: time.Now(), Model: "minimax-agent"})
+	}
+
+	cases := []struct {
+		path   string
+		handle func(w http.ResponseWriter, r *http.Request)
+	}{
+		{"/admin/api/accounts?page=9223372036854775807", api.listAccounts},
+		{"/admin/api/audits?page=9223372036854775807", api.listAudits},
+		{"/admin/api/accounts?page=2000000", api.listAccounts}, // past the clamp
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			tc.handle(rec, httptest.NewRequest("GET", tc.path, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				Items []any `json:"items"`
+				Total int   `json:"total"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode response: %v (body=%s)", err, rec.Body.String())
+			}
+			if body.Total != 3 {
+				t.Errorf("total = %d, want 3 (an over-range page must not hide the data)", body.Total)
+			}
+			if len(body.Items) != 0 {
+				t.Errorf("got %d items, want none past the last page", len(body.Items))
+			}
+		})
+	}
+}
+
+// TestLoginLocksAfterRepeatedFailures: five consecutive bad passwords from one
+// address lock the endpoint, and the lock holds even for the right password —
+// otherwise the lockout would announce when to retry the brute force with the
+// correct credential.
+func TestLoginLocksAfterRepeatedFailures(t *testing.T) {
+	api, _ := newTestAPI(t)
+	attempt := func(password string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]string{"username": "admin", "password": password})
+		rec := httptest.NewRecorder()
+		api.login(rec, httptest.NewRequest("POST", "/admin/api/auth/login", bytes.NewReader(body)))
+		return rec
+	}
+
+	for i := 1; i <= 5; i++ {
+		if rec := attempt("wrong"); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("failure %d: status %d, want 401", i, rec.Code)
+		}
+	}
+
+	rec := attempt("wrong")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("6th attempt: status %d, want 429 (body %s)", rec.Code, rec.Body.String())
+	}
+	if retryAfter := rec.Header().Get("retry-after"); retryAfter == "" {
+		t.Error("the 429 should carry a Retry-After header")
+	}
+	if rec := attempt("admin12345"); rec.Code != http.StatusTooManyRequests {
+		t.Errorf("correct password while locked: status %d, want 429", rec.Code)
+	}
+}
+
+// TestLoginSuccessResetsFailureCountAndAudits: a real login clears the
+// address's counter and lands an auditable record, so a operator's own typo
+// streak cannot lock them out after the next sign-in.
+func TestLoginSuccessResetsFailureCountAndAudits(t *testing.T) {
+	api, st := newTestAPI(t)
+	attempt := func(password string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]string{"username": "admin", "password": password})
+		rec := httptest.NewRecorder()
+		api.login(rec, httptest.NewRequest("POST", "/admin/api/auth/login", bytes.NewReader(body)))
+		return rec
+	}
+
+	for i := 1; i <= 4; i++ {
+		if rec := attempt("wrong"); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("failure %d: status %d, want 401", i, rec.Code)
+		}
+	}
+	if rec := attempt("admin12345"); rec.Code != http.StatusOK {
+		t.Fatalf("correct login after 4 failures: status %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+
+	audited := false
+	for _, audit := range st.ListAudits() {
+		if audit.Action == "登录成功" {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Error("a successful login should leave an audit record")
+	}
+
+	// The counter was wiped: four more failures are still 401, not a 429 left
+	// over from before the successful login.
+	for i := 1; i <= 4; i++ {
+		if rec := attempt("wrong"); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("failure %d after re-login: status %d, want 401", i, rec.Code)
+		}
+	}
+}
+
+// TestExportImportRoundTripPreservesKindEnabledRegion: the export is the
+// import format, so kind, enabled flag and region must survive a full round
+// trip — through both the update path (token already known) and a fresh store.
+func TestExportImportRoundTripPreservesKindEnabledRegion(t *testing.T) {
+	api, st := newTestAPI(t)
+	account := addAccount(t, st, map[string]any{"user_id": "7", "phone": "+8613800138000"}, store.RegionCN)
+	if _, err := st.UpdateAccount(account.ID, func(target *store.Account) {
+		// Shape an account no newer build would create by default: a guest kind
+		// and a disabled flag, exactly what the old export used to drop.
+		target.Kind = store.KindGuest
+		target.Enabled = false
+	}); err != nil {
+		t.Fatalf("seed kind/enabled: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	api.exportAccounts(rec, httptest.NewRequest("GET", "/admin/api/accounts/export", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("export: status %d, body %s", rec.Code, rec.Body.String())
+	}
+	var exported struct {
+		Accounts []map[string]any `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &exported); err != nil {
+		t.Fatalf("decode export: %v (body=%s)", err, rec.Body.String())
+	}
+	if len(exported.Accounts) != 1 {
+		t.Fatalf("exported %d accounts, want 1", len(exported.Accounts))
+	}
+
+	importBlob := func(api2 *API, accounts []map[string]any) (created, updated, failed int) {
+		// The import endpoint takes the exported array inside its "json" field,
+		// exactly the shape the console posts back.
+		payload, err := json.Marshal(map[string]any{"json": map[string]any{"accounts": accounts}})
+		if err != nil {
+			t.Fatalf("marshal import payload: %v", err)
+		}
+		rec := httptest.NewRecorder()
+		api2.importAccounts(rec, httptest.NewRequest("POST", "/admin/api/accounts/import", bytes.NewReader(payload)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("import: status %d, body %s", rec.Code, rec.Body.String())
+		}
+		var result struct {
+			Created int `json:"created"`
+			Updated int `json:"updated"`
+			Failed  int `json:"failed"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+			t.Fatalf("decode import: %v", err)
+		}
+		return result.Created, result.Updated, result.Failed
+	}
+
+	// Re-import over the existing token: an update, not a duplicate.
+	if created, updated, failed := importBlob(api, exported.Accounts); created != 0 || updated != 1 || failed != 0 {
+		t.Fatalf("re-import = created %d updated %d failed %d, want 0/1/0", created, updated, failed)
+	}
+	after, ok := st.AccountByID(account.ID)
+	if !ok {
+		t.Fatal("account vanished after re-import")
+	}
+	if after.Kind != store.KindGuest {
+		t.Errorf("kind = %q, want %q preserved through the round trip", after.Kind, store.KindGuest)
+	}
+	if after.Enabled {
+		t.Error("enabled = true, want the exported false preserved")
+	}
+	if after.Region != store.RegionCN {
+		t.Errorf("region = %q, want %q preserved", after.Region, store.RegionCN)
+	}
+
+	// A region-less re-import must not stomp a manually chosen region — not
+	// even with the token's own inference.
+	if _, err := st.UpdateAccount(account.ID, func(target *store.Account) {
+		target.Region = store.RegionGlobal
+	}); err != nil {
+		t.Fatalf("move region: %v", err)
+	}
+	if _, updated, failed := importBlob(api, []map[string]any{{"token": account.Token}}); updated != 1 || failed != 0 {
+		t.Fatalf("region-less re-import = updated %d failed %d, want 1/0", updated, failed)
+	}
+	if after, _ = st.AccountByID(account.ID); after.Region != store.RegionGlobal {
+		t.Errorf("region = %q, want %q: a region-less re-import must not overwrite it", after.Region, store.RegionGlobal)
+	}
+
+	// A fresh store rebuilds the account with the same shape.
+	st2, err := store.Open(t.TempDir(), "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("open second store: %v", err)
+	}
+	t.Cleanup(func() { _ = st2.Close() })
+	api2 := &API{store: st2}
+	if created, _, failed := importBlob(api2, exported.Accounts); created != 1 || failed != 0 {
+		t.Fatalf("fresh import = created %d failed %d, want 1/0", created, failed)
+	}
+	if rebuilt := st2.ListAccounts(); len(rebuilt) != 1 {
+		t.Fatalf("rebuilt %d accounts, want 1", len(rebuilt))
+	} else if candidate := rebuilt[0]; candidate.Kind != store.KindGuest || candidate.Enabled || candidate.Region != store.RegionCN {
+		t.Errorf("rebuilt account = kind %q enabled %v region %q, want guest/false/cn",
+			candidate.Kind, candidate.Enabled, candidate.Region)
+	}
+}
+
+// TestUpdateAccountValidatesRegionAndToken pins the PATCH-time validation: an
+// unknown region and a truncated token are refused instead of stored.
+func TestUpdateAccountValidatesRegionAndToken(t *testing.T) {
+	api, st := newTestAPI(t)
+	account := addAccount(t, st, map[string]any{"user_id": "1", "phone": "+8613800138000"}, "")
+
+	// updateAccount reads the id from the route pattern, so the request has to
+	// travel through a mux for {id} to be populated.
+	mux := http.NewServeMux()
+	mux.HandleFunc("PATCH /admin/api/accounts/{id}", api.updateAccount)
+	patch := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPatch, "/admin/api/accounts/"+account.ID, strings.NewReader(body)))
+		return rec
+	}
+
+	if rec := patch(`{"region":"moon"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("region moon: status %d, want 400 (body %s)", rec.Code, rec.Body.String())
+	}
+	if rec := patch(`{"token":"short"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("short token: status %d, want 400", rec.Code)
+	}
+	if rec := patch(`{"token":"aaaa bbbb cccc dddd eeee"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("token with whitespace: status %d, want 400", rec.Code)
+	}
+
+	// A valid region applies, and the account is otherwise untouched.
+	if rec := patch(`{"region":"global"}`); rec.Code != http.StatusOK {
+		t.Fatalf("region global: status %d, body %s", rec.Code, rec.Body.String())
+	}
+	after, ok := st.AccountByID(account.ID)
+	if !ok {
+		t.Fatal("account vanished")
+	}
+	if after.Region != store.RegionGlobal {
+		t.Errorf("region = %q, want %q", after.Region, store.RegionGlobal)
+	}
+}
+
+// TestAdminResponsesAreNoStore: every /admin/api response — guarded or not —
+// must be marked uncacheable, because session tokens travel in the bodies.
+func TestAdminResponsesAreNoStore(t *testing.T) {
+	api, _ := newTestAPI(t)
+	mux := http.NewServeMux()
+	api.Register(mux)
+
+	body, _ := json.Marshal(map[string]string{"username": "admin", "password": "admin12345"})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/api/auth/login", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login: status %d, body %s", rec.Code, rec.Body.String())
+	}
+	if cc := rec.Header().Get("cache-control"); cc != "no-store" {
+		t.Errorf("login cache-control = %q, want no-store", cc)
+	}
+
+	// A guarded route answers 401 here, and the header must be present on that
+	// response too — the middleware wraps the route, not the handler outcome.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/admin/api/dashboard", nil))
+	if cc := rec.Header().Get("cache-control"); cc != "no-store" {
+		t.Errorf("dashboard cache-control = %q, want no-store", cc)
+	}
+}
+
+// TestDashboardDropsFakeUsageFields: reasoningTokens was declared but never
+// accumulated, and the throughput/cost pair was hardcoded zero. Real numbers or
+// no numbers — the dashboard must not report fiction.
+func TestDashboardDropsFakeUsageFields(t *testing.T) {
+	api, _ := newTestAPI(t)
+	rec := httptest.NewRecorder()
+	api.dashboard(rec, httptest.NewRequest("GET", "/admin/api/dashboard", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashboard: status %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Usage map[string]any `json:"usage"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode dashboard: %v", err)
+	}
+	for _, key := range []string{"reasoningTokens", "estimatedCostUsd", "averageOutputTokensPerSecond", "throughputSamples"} {
+		if _, ok := body.Usage[key]; ok {
+			t.Errorf("usage.%s should be gone: it was never computed", key)
+		}
 	}
 }
