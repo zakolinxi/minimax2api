@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"minimax2api/internal/config"
@@ -79,6 +80,11 @@ var ErrAgentIDUnknown = errors.New("minimax agent id unknown")
 // so one client sending a bad attachment URL was enough to walk the whole pool
 // into cooldown and then answer everyone with "all accounts are busy".
 var ErrUpstreamRejected = errors.New("minimax rejected the request")
+
+// ErrEmptyResponse marks a turn the upstream ended without producing anything.
+// It is neither a refusal (another account may answer) nor an account fault
+// (the pool must not cool the account down for it).
+var ErrEmptyResponse = errors.New("upstream returned an empty response")
 
 // UpstreamRejection carries the status the upstream answered with, so callers
 // can hand the caller back the real reason instead of a blanket 502.
@@ -259,6 +265,13 @@ type Client struct {
 	// retried turn on the same account must not push the same bytes upstream
 	// twice. See upload.go.
 	uploads uploadCache
+	// proxyMu guards the lazily built proxied client. do() used to construct a
+	// fresh http.Client and Transport for every proxied request — a new TCP and
+	// TLS handshake per call and an idle pool nobody reused. The client is
+	// rebuilt only when the console changes the proxy address.
+	proxyMu     sync.Mutex
+	proxyClient *http.Client
+	proxyFor    string
 }
 
 // clock returns the client's time source. A zero-value Client is usable, which
@@ -507,7 +520,15 @@ func (c *Client) newRequest(ctx context.Context, settings config.Settings, cred 
 	}
 	req, err := http.NewRequestWithContext(ctx, method, rawURL, reader)
 	if err != nil {
-		return nil, err
+		// A malformed URL puts the whole signed URL — token query included —
+		// into the error text, and this error reaches pool.LastError and the
+		// API response. Strip the query the way transportError does.
+		sanitized := err.Error()
+		if parsed, parseErr := url.Parse(rawURL); parseErr == nil {
+			parsed.RawQuery = ""
+			sanitized = strings.ReplaceAll(sanitized, rawURL, parsed.String())
+		}
+		return nil, errors.New(sanitized)
 	}
 
 	bodyText := string(body)
@@ -529,14 +550,36 @@ func (c *Client) newRequest(ctx context.Context, settings config.Settings, cred 
 
 func (c *Client) do(req *http.Request, settings config.Settings) (*http.Response, error) {
 	if settings.Upstream.Proxy == "" {
-		resp, err := c.http.Do(req)
+		// A zero-value Client is usable, matching the clock seam: a nil
+		// unproxied client falls back to the default one.
+		client := c.http
+		if client == nil {
+			client = http.DefaultClient
+		}
+		resp, err := client.Do(req)
 		return resp, transportError(err)
 	}
-	proxyURL, err := parseProxy(settings.Upstream.Proxy)
+	client, err := c.clientForProxy(settings.Upstream.Proxy)
 	if err != nil {
 		return nil, err
 	}
-	client := &http.Client{
+	resp, err := client.Do(req)
+	return resp, transportError(err)
+}
+
+// clientForProxy returns the shared HTTP client for one proxy address, building
+// it on first use and rebuilding only when the configured address changes.
+func (c *Client) clientForProxy(raw string) (*http.Client, error) {
+	c.proxyMu.Lock()
+	defer c.proxyMu.Unlock()
+	if c.proxyClient != nil && c.proxyFor == raw {
+		return c.proxyClient, nil
+	}
+	proxyURL, err := parseProxy(raw)
+	if err != nil {
+		return nil, err
+	}
+	c.proxyClient = &http.Client{
 		Transport: &http.Transport{
 			Proxy: func(target *http.Request) (*url.URL, error) {
 				// Loopback never goes through the proxy.
@@ -560,8 +603,8 @@ func (c *Client) do(req *http.Request, settings config.Settings) (*http.Response
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
-	resp, err := client.Do(req)
-	return resp, transportError(err)
+	c.proxyFor = raw
+	return c.proxyClient, nil
 }
 
 // transportError strips the request URL out of a transport failure.
@@ -780,7 +823,12 @@ func (c *Client) sendMessage(ctx context.Context, opts Options, sessionID string
 	}
 	result.Media = dedupeMedia(result.Media)
 	if result.Text == "" && result.Thinking == "" && len(result.Media) == 0 {
-		return result, errors.New("upstream returned an empty response")
+		// ErrEmptyResponse, not a bare error: an empty stream is usually a
+		// content filter or a hiccup, and as a bare error it charged the
+		// account a cooldown for it. It is deliberately not
+		// ErrUpstreamRejected either — the gateway may still try another
+		// account, which a refusal forbids.
+		return result, ErrEmptyResponse
 	}
 	return result, nil
 }
@@ -929,7 +977,14 @@ func (c *Client) consumeStream(body io.ReadCloser, opts Options, result *Result)
 		if n > 0 {
 			idleTimer.Reset(idle)
 			buffer.Write(chunk[:n])
-			text := buffer.String()
+			// SSE allows \r\n line endings; the spec's framing is then
+			// "\r\n\r\n", which contains no "\n\n" substring. Normalising the
+			// line endings before scanning is what the spec itself does, and it
+			// cannot corrupt a payload: an SSE data line never carries a raw
+			// newline. Without this, a CRLF stream fails to frame, falls
+			// through to the tail handler as one giant frame, and the answer
+			// disappears without an error.
+			text := strings.ReplaceAll(buffer.String(), "\r\n", "\n")
 			for {
 				index := strings.Index(text, "\n\n")
 				if index < 0 {
