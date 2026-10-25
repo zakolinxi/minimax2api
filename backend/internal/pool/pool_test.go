@@ -967,3 +967,143 @@ func TestConcurrentSchedulingAndStateWrites(t *testing.T) {
 		t.Fatal("concurrent scheduling deadlocked")
 	}
 }
+
+// --- caller cancellation ----------------------------------------------------
+
+// A caller that hung up must not charge the account. This is the test that
+// keeps the cancellation exemption honest: without it, every "stop" button
+// press in every client walked healthy accounts into longer and longer
+// cooldowns.
+func TestReleaseIgnoresCallerCancellation(t *testing.T) {
+	f := newFixture(t)
+	f.addAccount(t, "a", 0)
+
+	lease := f.acquire(t, "sess")
+	lease.Release(context.Canceled)
+
+	account := f.reload(t, "a")
+	if account.FailCount != 0 {
+		t.Fatalf("fail count = %d, want 0 for a caller hang-up", account.FailCount)
+	}
+	if account.Status != store.StatusActive {
+		t.Fatalf("status = %q, want %q", account.Status, store.StatusActive)
+	}
+	if account.LastError != "" {
+		t.Fatalf("last error = %q, want empty", account.LastError)
+	}
+	// The slot must still be freed — release is bookkeeping as well as verdict.
+	if got := f.pool.Inflight("a"); got != 0 {
+		t.Fatalf("inflight = %d, want 0", got)
+	}
+}
+
+// A cancellation is not a refusal either: the next acquire gets the same
+// account back rather than being forced onto another one.
+func TestCancelledAccountIsImmediatelyRoutable(t *testing.T) {
+	f := newFixture(t)
+	f.addAccount(t, "only", 0)
+
+	lease := f.acquire(t, "sess")
+	lease.Release(context.Canceled)
+
+	again, err := f.pool.Acquire(context.Background(), "other")
+	if err != nil {
+		t.Fatalf("acquire after cancellation: %v", err)
+	}
+	if again.Account.ID != "only" {
+		t.Fatalf("picked %q, want the same account to stay in rotation", again.Account.ID)
+	}
+	again.Release(nil)
+}
+
+// --- sticky under saturation ------------------------------------------------
+
+// A sticky account that is merely out of slots must lose the session only
+// temporarily: the overload reroutes one request, and when a slot frees up the
+// session returns to its bound account. Rewriting the binding on every
+// saturation detour made the detour permanent.
+func TestStickySurvivesTransientSaturation(t *testing.T) {
+	f := newFixture(t)
+	f.addAccountWith(t, "bound", 0, "token-bound", 1)
+	f.addAccountWith(t, "spare", 50, "token-spare", 4)
+
+	first := f.acquire(t, "sess")
+	if first.Account.ID != "bound" {
+		t.Fatalf("first pick = %q, want the bound account", first.Account.ID)
+	}
+	first.Release(nil)
+
+	// The bound account is picked again for a different session and stays
+	// holding its slot, so "sess" has to detour — without rewriting its
+	// binding.
+	holding := f.acquire(t, "other-session")
+	if holding.Account.ID != "bound" {
+		t.Fatalf("holder pick = %q, want the bound account", holding.Account.ID)
+	}
+	detour := f.acquire(t, "sess")
+	if detour.Account.ID != "spare" {
+		t.Fatalf("detour pick = %q, want the spare", detour.Account.ID)
+	}
+	detour.Release(nil)
+	holding.Release(nil)
+
+	// Slots are free again: the session must come home.
+	returned := f.acquire(t, "sess")
+	if returned.Account.ID != "bound" {
+		t.Fatalf("pick after saturation cleared = %q, want the original binding", returned.Account.ID)
+	}
+	returned.Release(nil)
+}
+
+// --- empty pool -------------------------------------------------------------
+
+// An empty pool cannot be fixed by waiting: acquire must say so at once
+// instead of holding the caller for the whole capacity timeout.
+func TestAcquireFailsFastOnEmptyPool(t *testing.T) {
+	f := newFixture(t)
+	f.settings.Routing.CapacityWaitSec = 5
+
+	started := time.Now()
+	_, err := f.pool.Acquire(context.Background(), "sess")
+	elapsed := time.Since(started)
+	if !errors.Is(err, ErrNoAccount) {
+		t.Fatalf("err = %v, want ErrNoAccount", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("acquire blocked %v on an empty pool", elapsed)
+	}
+}
+
+// --- sticky map growth ------------------------------------------------------
+
+// Session keys are caller-supplied, so the sticky map has to stop growing at
+// some point: the sweep of expired entries must bring the size back down.
+func TestStickyMapSweepsExpiredEntries(t *testing.T) {
+	f := newFixture(t)
+	f.addAccount(t, "a", 0)
+	f.settings.Routing.StickyTTLSec = 1
+
+	for i := 0; i < 1100; i++ {
+		lease, err := f.pool.Acquire(context.Background(), fmt.Sprintf("sess-%d", i))
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		lease.Release(nil)
+	}
+	// Age every entry past its TTL.
+	time.Sleep(1100 * time.Millisecond)
+
+	// One more acquire over the limit triggers the sweep.
+	lease, err := f.pool.Acquire(context.Background(), "fresh")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	lease.Release(nil)
+
+	f.pool.mu.Lock()
+	size := len(f.pool.sticky)
+	f.pool.mu.Unlock()
+	if size > 16 {
+		t.Fatalf("sticky map still holds %d entries after the sweep", size)
+	}
+}

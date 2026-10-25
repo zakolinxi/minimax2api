@@ -30,6 +30,11 @@ type stickyEntry struct {
 	expires   time.Time
 }
 
+// maxStickyEntries bounds how large the sticky map may grow before expired
+// entries are swept. Session keys are caller-supplied and effectively
+// unbounded, so without this the map leaks one entry per unique key.
+const maxStickyEntries = 1024
+
 // Pool owns account selection, in-flight accounting and cooldown state.
 type Pool struct {
 	mu       sync.Mutex
@@ -109,7 +114,11 @@ func (p *Pool) AcquireWith(ctx context.Context, opts AcquireOptions) (*Lease, er
 		if account != nil {
 			return &Lease{Account: account, pool: p}, nil
 		}
-		if errors.Is(wait, ErrNoEligible) || time.Now().After(deadline) {
+		// ErrNoEligible and ErrNoAccount cannot be cured by waiting: the first
+		// because no release can make an account pass the filter, the second
+		// because there is nothing in the pool at all. Waiting out the full
+		// capacity timeout would only hold the caller hostage.
+		if errors.Is(wait, ErrNoEligible) || errors.Is(wait, ErrNoAccount) || time.Now().After(deadline) {
 			return nil, wait
 		}
 		select {
@@ -150,13 +159,33 @@ func (p *Pool) pick(opts AcquireOptions) (*store.Account, error) {
 
 	now := time.Now()
 
+	// The sticky map is keyed by caller-supplied session keys, so it grows with
+	// the key space and nothing evicts keys that never come back. Once it is
+	// clearly past a sane working set, drop every expired entry in one pass.
+	if len(p.sticky) > maxStickyEntries {
+		for key, entry := range p.sticky {
+			if now.After(entry.expires) {
+				delete(p.sticky, key)
+			}
+		}
+	}
+
 	// Sticky sessions reuse their previous account while it stays routable.
+	// hadSticky stays true when the bound account merely has no free slot right
+	// now: a saturation blip then reroutes the request without rewriting the
+	// binding, so the session returns to its account once a slot frees up. Only
+	// a binding whose account is gone is treated as stale and re-bound below.
+	hadSticky := false
 	if sessionKey != "" && settings.StickyTTL() > 0 {
 		if entry, ok := p.sticky[sessionKey]; ok {
 			if now.After(entry.expires) {
 				delete(p.sticky, sessionKey)
 			} else {
+				bound := false
 				for _, account := range accounts {
+					if account.ID == entry.accountID {
+						bound = true
+					}
 					if account.ID != entry.accountID || (eligible != nil && !eligible(account)) {
 						continue
 					}
@@ -167,6 +196,7 @@ func (p *Pool) pick(opts AcquireOptions) (*store.Account, error) {
 						return account, nil
 					}
 				}
+				hadSticky = bound
 			}
 		}
 	}
@@ -214,7 +244,7 @@ func (p *Pool) pick(opts AcquireOptions) (*store.Account, error) {
 	}
 
 	p.inflight[chosen.ID]++
-	if sessionKey != "" && settings.StickyTTL() > 0 {
+	if !hadSticky && sessionKey != "" && settings.StickyTTL() > 0 {
 		p.sticky[sessionKey] = stickyEntry{accountID: chosen.ID, expires: now.Add(settings.StickyTTL())}
 	}
 	return chosen, nil
@@ -296,7 +326,18 @@ func (p *Pool) release(id string, err error) {
 		// the next account answers the same way. Charging it here is how one
 		// caller's bad payload walks the pool into cooldown, so the account is
 		// returned to service untouched rather than blamed.
-		if errors.Is(err, minimax.ErrUpstreamRejected) {
+		if errors.Is(err, minimax.ErrUpstreamRejected) || errors.Is(err, minimax.ErrEmptyResponse) {
+			return
+		}
+
+		// A caller that walked away — the user hit stop, the browser tab closed,
+		// an intermediate proxy cut the stream — says just as little about the
+		// account. Cancellation is the one error class that is always the
+		// caller's own doing, so it is returned to service untouched. Deadlines
+		// are deliberately NOT exempted: request contexts carry no deadline, so
+		// one can only come from this gateway's own upstream timeout, which is
+		// real evidence that the account was too slow to answer.
+		if errors.Is(err, context.Canceled) {
 			return
 		}
 
