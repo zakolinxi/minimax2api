@@ -356,3 +356,52 @@ func TestFilesAreScopedToTheirKey(t *testing.T) {
 		t.Fatalf("own delete = HTTP %d, want 200: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// The REST file endpoints were scoped to the uploading key; the chat path —
+// the one that ships the bytes upstream and back to the caller — used to take
+// any file_id it was handed. A leaked key must not be able to read another
+// key's uploads through a message.
+func TestChatFileIDRefusesAnotherKeysUpload(t *testing.T) {
+	h, _, _ := newFileHarness(t)
+	h.addAccount(t, "worker", "token-worker", 10)
+	other, err := h.store.CreateClientKey("other-key", 0, 0)
+	if err != nil {
+		t.Fatalf("create second key: %v", err)
+	}
+
+	uploaded := uploadFile(t, h, "private.txt", "owner-only content")
+	id := uploaded["id"].(string)
+
+	rec := h.chat(t, map[string]any{
+		"model": "minimax-agent",
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "总结这个文件"},
+				map[string]any{"type": "file", "file": map[string]any{"file_id": id}},
+			},
+		}},
+	}, other.Key)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unknown file_id") {
+		t.Fatalf("body = %s, want an unknown-file_id refusal", rec.Body.String())
+	}
+
+	// The owner still rides its own file through a chat turn.
+	own := h.chat(t, map[string]any{
+		"model": "minimax-agent",
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "总结这个文件"},
+				map[string]any{"type": "file", "file": map[string]any{"file_id": id}},
+			},
+		}},
+	}, h.key)
+	if own.Code != http.StatusOK {
+		t.Fatalf("owner status = %d, want 200; body = %s", own.Code, own.Body.String())
+	}
+}

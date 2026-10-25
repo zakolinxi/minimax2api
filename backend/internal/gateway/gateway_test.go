@@ -2270,7 +2270,7 @@ func TestBuildPromptReplaysToolHistory(t *testing.T) {
 		t.Fatalf("decode conversation: %v", err)
 	}
 
-	prompt, _, _, err := h.gateway.buildPrompt(context.Background(), messages, -1)
+	prompt, _, _, err := h.gateway.buildPrompt(context.Background(), messages, -1, "")
 	if err != nil {
 		t.Fatalf("buildPrompt: %v", err)
 	}
@@ -2316,7 +2316,7 @@ func TestBuildPromptSkipsDownloadsBeyondTheReferenceCap(t *testing.T) {
 	}
 
 	keep, _ := referenceLimit(model, countImageReferences(messages))
-	_, images, _, err := h.gateway.buildPrompt(context.Background(), messages, keep)
+	_, images, _, err := h.gateway.buildPrompt(context.Background(), messages, keep, "")
 	if err != nil {
 		t.Fatalf("buildPrompt: %v", err)
 	}

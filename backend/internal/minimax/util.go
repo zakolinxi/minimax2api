@@ -72,10 +72,21 @@ func DownloadClient(settings config.Settings) *http.Client {
 		MaxIdleConnsPerHost: 8,
 		IdleConnTimeout:     90 * time.Second,
 	}
-	proxyHost := ""
+	proxyHost, proxyPort := "", ""
 	if raw := strings.TrimSpace(settings.Upstream.Proxy); raw != "" {
 		if proxyURL, err := parseProxy(raw); err == nil {
 			proxyHost = strings.TrimSpace(proxyURL.Hostname())
+			proxyPort = proxyURL.Port()
+			if proxyPort == "" {
+				// The transport dials the proxy with the scheme's default port
+				// when the URL omits one; the exemption below must match that
+				// same address.
+				if proxyURL.Scheme == "https" {
+					proxyPort = "443"
+				} else {
+					proxyPort = "80"
+				}
+			}
 			transport.Proxy = func(target *http.Request) (*url.URL, error) {
 				if isLoopbackHost(target.URL.Hostname()) {
 					return nil, nil
@@ -87,11 +98,16 @@ func DownloadClient(settings config.Settings) *http.Client {
 	if !settings.Security.AllowPrivateFetch {
 		var dialer net.Dialer
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, _, err := net.SplitHostPort(addr)
+			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err
 			}
-			if proxyHost != "" && strings.EqualFold(host, proxyHost) {
+			// The exemption is for the dial TO the proxy itself, so it must
+			// match the proxy's host AND port. Host alone would also exempt
+			// every other port on the same address — and with a local proxy
+			// that address is loopback, which would hand back the SSRF
+			// doorway this dialer exists to close.
+			if proxyHost != "" && strings.EqualFold(host, proxyHost) && port == proxyPort {
 				return dialer.DialContext(ctx, network, addr)
 			}
 			if err := ensurePublicHost(ctx, host); err != nil {

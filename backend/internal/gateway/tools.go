@@ -223,6 +223,16 @@ type toolSplitter struct {
 	pending strings.Builder
 }
 
+// reset drops whatever a failed attempt left inside the splitter. Streaming
+// used to be unfailable, so the splitter lived exactly as long as one upstream
+// call; with mid-stream failover the same splitter now survives into the next
+// attempt, and bytes the first attempt pushed in — a half-seen tag, a tool
+// block that never closed — would bleed into the second answer.
+func (s *toolSplitter) reset() {
+	s.inBlock = false
+	s.pending.Reset()
+}
+
 func newToolSplitter(enabled bool) *toolSplitter {
 	return &toolSplitter{enabled: enabled}
 }

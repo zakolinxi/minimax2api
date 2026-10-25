@@ -191,7 +191,13 @@ export function RequestAuditsPage() {
                   <TableCell className="hidden text-xs text-muted-foreground md:table-cell">{item.keyName || "—"}</TableCell>
                   <TableCell className="hidden text-xs text-muted-foreground md:table-cell">{item.accountName || "—"}</TableCell>
                   <TableCell className="text-center">
-                    <Badge variant={item.status < 400 ? "default" : "destructive"}>{item.status}</Badge>
+                    {/* Console actions carry no HTTP status — a zero would read
+                        as a traffic row that somehow answered with status 0. */}
+                    {item.action ? (
+                      <Badge variant="outline">{t("audits.actionBadge")}</Badge>
+                    ) : (
+                      <Badge variant={item.status < 400 ? "default" : "destructive"}>{item.status}</Badge>
+                    )}
                   </TableCell>
                   <TableCell className="hidden text-center text-xs tabular-nums md:table-cell">{formatDuration(item.latencyMs)}</TableCell>
                   <TableCell className="hidden text-center text-xs tabular-nums md:table-cell">{formatDuration(item.firstTokenMs)}</TableCell>
@@ -223,7 +229,7 @@ export function RequestAuditsPage() {
                 <DetailItem label={t("audits.model")} value={detail.model} />
                 <DetailItem label={t("audits.account")} value={detail.accountName || "—"} />
                 <DetailItem label={t("audits.key")} value={detail.keyName || "—"} />
-                <DetailItem label={t("audits.status")} value={String(detail.status)} />
+                <DetailItem label={t("audits.status")} value={detail.action ? "—" : String(detail.status)} />
                 <DetailItem label={t("audits.latency")} value={formatDuration(detail.latencyMs)} />
                 <DetailItem label={t("audits.firstToken")} value={formatDuration(detail.firstTokenMs)} />
                 <DetailItem label={t("audits.retries")} value={String(detail.retries)} />

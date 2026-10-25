@@ -73,6 +73,13 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
       // Already sitting on the login page (a stale token in storage gets
       // probed on mount): clear it and stay put instead of reloading.
       if (window.location.pathname !== "/login") {
+        try {
+          // The hard navigation loses react-router's state.from, so carry the
+          // current location for the login page to send the operator back to.
+          window.sessionStorage.setItem("minimax2api:login-from", window.location.pathname + window.location.search);
+        } catch {
+          // Storage can be unavailable; the login page falls back to /dashboard.
+        }
         window.location.assign("/login");
       }
     }

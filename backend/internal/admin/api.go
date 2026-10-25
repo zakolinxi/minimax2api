@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -1602,8 +1603,10 @@ func (a *API) syncQuota(ctx context.Context, id string) error {
 
 	// Cancellation and deadline exhaustion belong to the caller or the probe
 	// budget, not the account: writing cooldown and Available=false for them
-	// used to bench healthy accounts whenever the console moved on.
-	if canceled(ctx, err) {
+	// used to bench healthy accounts whenever the console moved on. An empty
+	// response is equally inconclusive — the pool deliberately does not charge
+	// it, and the quota readout should not either.
+	if canceled(ctx, err) || errors.Is(err, minimax.ErrEmptyResponse) {
 		return err
 	}
 	a.store.SaveAccountState(id, func(target *store.Account) {
@@ -1934,6 +1937,7 @@ func (a *API) listAudits(w http.ResponseWriter, r *http.Request) {
 func auditMatchesSearch(audit *store.Audit, needle, modelName string) bool {
 	fields := [...]string{
 		audit.ID, audit.Model, modelName, audit.KeyName, audit.AccountName,
+		audit.Action, audit.Detail,
 		audit.IP, audit.UserAgent, strconv.Itoa(audit.Status),
 		audit.Error, audit.RequestBody, audit.ResponseBody,
 	}
@@ -2035,6 +2039,24 @@ func (a *API) saveSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if payload.Upstream != nil {
+			// The upstream host receives every account credential on every
+			// signed call (the token rides in the URL query), so a hostile
+			// value here is a credential-drain valve. A URL with no scheme
+			// parses as a relative path and would silently break every call;
+			// anything non-http(s) has no business being an API host.
+			for name, value := range map[string]string{
+				"baseURL":       payload.Upstream.BaseURL,
+				"streamBaseURL": payload.Upstream.StreamBaseURL,
+			} {
+				if strings.TrimSpace(value) == "" {
+					continue
+				}
+				parsed, err := url.Parse(strings.TrimSpace(value))
+				if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+					writeError(w, http.StatusBadRequest, fmt.Sprintf("%s 必须是合法的 http(s) 地址", name))
+					return
+				}
+			}
 			settings.Upstream = *payload.Upstream
 		}
 		if payload.Routing != nil {
@@ -2051,9 +2073,9 @@ func (a *API) saveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if payload.Video != nil {
 			settings.Video = *payload.Video
-			if payload.Security != nil {
-				settings.Security = *payload.Security
-			}
+		}
+		if payload.Security != nil {
+			settings.Security = *payload.Security
 		}
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

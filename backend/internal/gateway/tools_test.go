@@ -337,3 +337,34 @@ func TestChatCompletionsStreamsToolCallsAtTheEnd(t *testing.T) {
 		t.Fatalf("finish_reason = %q", finish)
 	}
 }
+
+// A failed streaming attempt can leave bytes inside the splitter — a half-seen
+// tag or an open tool block. The next attempt must start clean, or the first
+// answer bleeds into the second.
+func TestToolSplitterResetDropsPartialState(t *testing.T) {
+	s := newToolSplitter(true)
+
+	// A truncated opening tag stays in pending; an open block swallows output.
+	if safe := s.push("<tool"); safe != "" {
+		t.Fatalf("truncated tag should be held, got %q", safe)
+	}
+	if safe := s.push("_calls>{\"name\":\"x\"}"); safe != "" {
+		t.Fatalf("block body should be swallowed, got %q", safe)
+	}
+
+	s.reset()
+
+	// The splitter always holds back the longest possible tag prefix, so a
+	// short delta stays pending until the tail flushes it. A longer one must
+	// pass through immediately, clean of the earlier attempt's bytes.
+	if safe := s.push("干净回答，今天天气很好"); safe != "干净回答，今天" {
+		t.Fatalf("after reset the delta should pass through minus the held tail, got %q", safe)
+	}
+	tail, calls := s.finish()
+	if tail != "天气很好" {
+		t.Fatalf("tail = %q, want the held remainder", tail)
+	}
+	if calls != nil {
+		t.Fatalf("calls = %v, want none — the pre-reset block must not resurrect", calls)
+	}
+}

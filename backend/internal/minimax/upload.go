@@ -283,8 +283,15 @@ func (c *Client) postToObjectStore(ctx context.Context, settings config.Settings
 	// POST form uploads with 200 or 201 just as validly. Anything in the 2xx
 	// range means the object landed; insisting on one status would fail every
 	// upload against such a store — and charge the account for it.
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		// A 4xx from the store is a policy problem — an expired signature, a
+		// clock skew, a condition mismatch — never evidence about the account.
+		// As a bare error it cooled the account down and sent the identical
+		// upload around the pool.
+		if rejectsRequest(resp.StatusCode) {
+			return &UpstreamRejection{Prefix: "object upload", Status: resp.StatusCode, Body: snippet(body)}
+		}
 		return fmt.Errorf("minimax object upload HTTP %d: %s", resp.StatusCode, snippet(body))
 	}
 	return nil

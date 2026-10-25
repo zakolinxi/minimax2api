@@ -15,6 +15,19 @@ export function LoginPage() {
   // AuthBoundary records the page that triggered the sign-in here.
   const location = useLocation();
   const state = location.state as { from?: string } | null;
+
+  // A mid-session expiry lands here through a hard navigation, which carries
+  // no router state; the API client breadcrumbs the original location into
+  // sessionStorage for exactly this case.
+  const bouncedFrom = (() => {
+    try {
+      const value = window.sessionStorage.getItem("minimax2api:login-from");
+      window.sessionStorage.removeItem("minimax2api:login-from");
+      return value;
+    } catch {
+      return null;
+    }
+  })();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -32,7 +45,7 @@ export function LoginPage() {
     setBusy(true);
     try {
       await login(username.trim(), password);
-      navigate(state?.from ?? "/dashboard", { replace: true });
+      navigate(state?.from ?? bouncedFrom ?? "/dashboard", { replace: true });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : t("errors.generic"));
     } finally {
