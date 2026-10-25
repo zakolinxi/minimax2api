@@ -8,6 +8,7 @@
 # Runtime state: the account pool, client keys and audit log all live here.
 # Committing it would leak live tokens.
 /data/
+.demo-accounts/
 
 # Render-check screenshots
 /render-out/
