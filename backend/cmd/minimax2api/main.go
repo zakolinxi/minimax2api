@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -52,8 +53,19 @@ func main() {
 	mux.HandleFunc("GET /v1/files/{id}/content", compat.FilesContent)
 	mux.HandleFunc("DELETE /v1/files/{id}", compat.FilesDelete)
 
-	mediaDir := st.Settings().Media.GeneratedDir
-	mux.Handle("GET /media/", http.StripPrefix("/media/", http.FileServer(http.Dir(mediaDir))))
+	// The media handler reads the directory from settings on every request so a
+	// console change takes effect without a restart, and refuses directory
+	// requests: a bare http.FileServer answers GET /media/ with a full listing
+	// of everything ever generated, which turns an unauthenticated endpoint
+	// into an index of the whole gallery.
+	mux.HandleFunc("GET /media/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		prefix := "/media/"
+		http.StripPrefix(prefix, http.FileServer(http.Dir(st.Settings().Media.GeneratedDir))).ServeHTTP(w, r)
+	})
 
 	registerDebug(mux)
 	registerStatic(mux, cfg.StaticDir)
@@ -106,11 +118,15 @@ func main() {
 func registerDebug(mux *http.ServeMux) {
 	local := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			host := r.RemoteAddr
-			if idx := strings.LastIndex(host, ":"); idx >= 0 {
-				host = host[:idx]
+			// RemoteAddr for an IPv6 loopback client reads "[::1]:port" —
+			// trimming at the last colon leaves the brackets on, and comparing
+			// that against "::1" never matched. Parse the address properly.
+			host, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				host = r.RemoteAddr
 			}
-			if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+			ip := net.ParseIP(host)
+			if ip == nil || !ip.IsLoopback() {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
@@ -149,6 +165,13 @@ func registerStatic(mux *http.ServeMux, staticDir string) {
 			serveIndex(w, r)
 			return
 		}
+		// A backslash or a dot-dot segment never names a bundled asset. On
+		// Windows a decoded %5C joins outside staticDir, and the stat below
+		// then answers "exists" for files the server must never confirm.
+		if strings.Contains(path, "\\") || strings.Contains(path, "..") {
+			http.NotFound(w, r)
+			return
+		}
 		// API prefixes are registered separately; anything else falls back to
 		// the SPA entry point when the file does not exist.
 		if _, err := os.Stat(filepath.Join(staticDir, filepath.Clean(strings.TrimPrefix(path, "/")))); err != nil {
@@ -179,14 +202,24 @@ func displayAddr(addr string) string {
 	return addr
 }
 
+// withCORS reflects the caller's origin without credentials.
+//
+// Authentication is an Authorization header carried by the client, so no
+// browser request needs `allow-credentials` — and reflecting any origin WITH
+// it (the previous behaviour) is the classic setup where a single cookie-based
+// session turns every website into a full-authority admin client. Without
+// credentials, reflecting the origin is what lets self-hosted browser clients
+// call /v1 with their own key while keeping the admin surface safe by
+// construction. Vary: Origin keeps shared caches from handing one origin's
+// preflight to another.
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("origin")
 		if origin != "" {
 			w.Header().Set("access-control-allow-origin", origin)
-			w.Header().Set("access-control-allow-credentials", "true")
 			w.Header().Set("access-control-allow-headers", "authorization,content-type,x-api-key,x-session-id")
 			w.Header().Set("access-control-allow-methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+			w.Header().Add("vary", "Origin")
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

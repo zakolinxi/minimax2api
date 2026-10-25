@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -302,7 +303,11 @@ func egressIP(ctx context.Context, proxy string) string {
 		return "unavailable: " + err.Error()
 	}
 	defer resp.Body.Close()
-	buf := make([]byte, 64)
-	n, _ := resp.Body.Read(buf)
-	return strings.TrimSpace(string(buf[:n]))
+	// A single Read can return one TCP segment short of the body; a truncated
+	// address silently misleads the egress diagnosis this probe exists for.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 256))
+	if err != nil {
+		return "unavailable: " + err.Error()
+	}
+	return strings.TrimSpace(string(body))
 }
