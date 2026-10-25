@@ -1282,3 +1282,52 @@ func TestOpenRejectsANewerSchemaVersion(t *testing.T) {
 		t.Fatalf("the version field was rewritten on disk: %d", got.Version)
 	}
 }
+
+// A rename that cannot land must surface as an error. The retry loop around
+// it used to swallow the failure and return nil, so writeSnapshot reported
+// success while the disk kept the previous snapshot — and the final-flush
+// guarantee of Close died quietly.
+func TestWriteFileAtomicReportsARenameFailure(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "app.json")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeFileAtomic(target, []byte("{}")); err == nil {
+		t.Fatal("renaming over a directory must fail, not report success")
+	}
+}
+
+// A transient rename failure recovers within the retry budget: a file locked
+// by a (simulated) scanner does not cost the snapshot.
+func TestWriteFileAtomicRetriesALockedTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "app.json")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the target open the way a scanner would; Windows refuses to rename
+	// over an open file. Release it almost immediately, inside the retry
+	// window.
+	lock, err := os.OpenFile(target, os.O_RDONLY, 0) // Windows: no delete/rename share
+	if err != nil {
+		t.Skip("cannot hold the target open on this platform")
+	}
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		_ = lock.Close()
+	}()
+
+	if err := writeFileAtomic(target, []byte("new")); err != nil {
+		t.Fatalf("writeFileAtomic: %v", err)
+	}
+	raw, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "new" {
+		t.Fatalf("target = %q, want the new snapshot", raw)
+	}
+}

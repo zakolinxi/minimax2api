@@ -46,7 +46,9 @@ export function GalleryPage() {
             // site-relative links are offered as a download; anything else
             // renders without one rather than handing the client a
             // javascript: or data: href.
-            const downloadable = /^https?:/i.test(item.url) || item.url.startsWith("/");
+            // "//host/…" is a protocol-relative URL pointing at a foreign
+            // origin; only same-origin paths and explicit http(s) may download.
+            const downloadable = (/^https?:/i.test(item.url) || item.url.startsWith("/")) && !item.url.startsWith("//");
             return (
               <article key={item.id} className="overflow-hidden rounded-lg bg-card">
                 <div className="relative aspect-square bg-secondary/60">

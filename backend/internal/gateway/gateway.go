@@ -12,6 +12,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -218,7 +219,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// cap rides into buildPrompt so the pictures beyond it are never fetched
 	// at all, not downloaded and then dropped.
 	keep, _ := referenceLimit(model, countImageReferences(request.Messages))
-	prompt, images, files, err := g.buildPrompt(r.Context(), request.Messages, keep)
+	prompt, images, files, err := g.buildPrompt(r.Context(), request.Messages, keep, key.ID)
 	if err != nil {
 		writeError(out, http.StatusBadRequest, err.Error())
 		return
@@ -259,9 +260,10 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Every chunk of one completion shares one id and one created stamp — that
 	// is the OpenAI stream contract, and clients that aggregate by id split a
 	// mixed-id stream into several completions.
-	stream := newSSEStream(out, model)
+	var stream *sseStream
 	var onDelta, onThinking func(string)
 	if request.Stream {
+		stream = newSSEStream(out, model)
 		onDelta = func(text string) {
 			if safe := splitter.push(text); safe != "" {
 				stream.delta(map[string]any{"content": safe}, nil)
@@ -286,11 +288,16 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model:        model,
 		Variant:      variant,
 		ContextLimit: contextLimit,
-		SessionKey:   request.User,
+		// The user field is caller-supplied, so the sticky key carries the
+		// client key with it: two keys that both claim user "1" must not end up
+		// pinned to the same account, where one could aim its expensive or
+		// failing requests at the other's binding.
+		SessionKey:   key.ID + ":" + request.User,
 		Started:      started,
 		OnDelta:      onDelta,
 		OnThinking:   onThinking,
 		Committed:    func() bool { return out.wroteHeader },
+		ResetStream:  splitter.reset,
 	})
 
 	accountName := turn.AccountName
@@ -404,6 +411,10 @@ type turnRequest struct {
 	// safe while nothing has been written: once the caller has seen a byte, a
 	// second account would append a second answer to the first.
 	Committed func() bool
+	// ResetStream drops per-attempt stream state before a retry. The tool
+	// splitter holds bytes between deltas — a half-seen tag, an open block —
+	// and a failed attempt must not leak those into the next answer.
+	ResetStream func()
 }
 
 // turnResult carries what the turn produced plus the bookkeeping an audit row
@@ -470,6 +481,9 @@ func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, er
 
 	var lastErr error
 	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
+		if attempt > 0 && req.ResetStream != nil {
+			req.ResetStream()
+		}
 		lease, err := g.acquireAccount(ctx, req.SessionKey, req.Model)
 		if err != nil {
 			return out, err
@@ -687,7 +701,7 @@ func writeChunkRaw(out *respWriter, model *store.ModelConfig, delta map[string]a
 // rather than by the caller afterwards, because resolving means downloading:
 // a caller that sent ten pictures at a cap of two must not pay for eight
 // fetches that were going to be dropped.
-func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage, imageCap int) (string, []minimax.UploadedImage, []minimax.PendingAttachment, error) {
+func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage, imageCap int, owner string) (string, []minimax.UploadedImage, []minimax.PendingAttachment, error) {
 	if len(messages) == 0 {
 		return "", nil, nil, nil
 	}
@@ -732,7 +746,7 @@ func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage, image
 			images = append(images, image)
 		}
 		for _, part := range fileParts {
-			file, err := g.resolveFilePart(part)
+			file, err := g.resolveFilePart(part, owner)
 			if err != nil {
 				return "", nil, nil, err
 			}
@@ -846,7 +860,7 @@ func (g *Gateway) downloadImage(ctx context.Context, raw string) (minimax.Upload
 	// gateway fetches.
 	response, err := minimax.DownloadClient(settings).Do(request)
 	if err != nil {
-		log.Printf("reference image fetch failed for %s: %v", raw, err)
+		log.Printf("reference image fetch failed for %s: %v", redactedURL(raw), err)
 		if errors.Is(err, minimax.ErrPrivateAddress) {
 			return minimax.UploadedImage{}, fmt.Errorf("fetch reference image: that address is not allowed")
 		}
@@ -1026,6 +1040,21 @@ func distance(a, b int) int {
 	return b - a
 }
 
+// redactedURL strips the query and userinfo from a URL before it reaches a
+// log line. Reference URLs are caller-supplied and routinely carry presigned
+// query parameters or even inline credentials; the host and path are all a
+// transport diagnosis needs.
+func redactedURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "<unparsable URL>"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
 // imageName derives a filename from a URL, falling back to a stable default.
 func imageName(raw string) string {
 	index := strings.LastIndex(raw, "/")
@@ -1155,7 +1184,9 @@ func (g *Gateway) runImageTurn(
 		lease.Release(err)
 
 		lastErr = err
-		if err == nil || isPoolExhausted(err) {
+		// Same rule as runTurn and the video path: a refusal is the request's
+		// fault, so trying it on the next account only spends one more.
+		if err == nil || isPoolExhausted(err) || errors.Is(err, minimax.ErrUpstreamRejected) {
 			break
 		}
 	}
@@ -1213,7 +1244,7 @@ func (g *Gateway) chatImage(
 		// closed. The role frame rides along via the stream's lazy emit.
 		stream := newSSEStream(out, model)
 		stream.delta(map[string]any{"content": content}, nil)
-		stream.finish(nil, nil, nil)
+		stream.finish(nil, nil, streamUsage(request, promptTokens, 0))
 		g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, promptTokens, 0, true, 0, string(body), content, "")
 		return
 	}

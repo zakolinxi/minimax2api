@@ -256,23 +256,24 @@ func writeFileAtomic(path string, raw []byte) error {
 		return err
 	}
 	// On Windows a freshly closed file can stay briefly locked by a scanning
-	// antivirus, and the rename then fails with "Access is denied" even though
-	// nothing else holds the handle. Retry a few times before giving up — the
-	// window is short and the state file is not worth a spurious failure.
+	// antivirus, and the rename then fails with "Access is denied" (or a
+	// sharing violation) even though nothing else holds the handle. Retry a
+	// few times regardless of the error kind — a permanent failure just costs
+	// five quick attempts before surfacing, while a transient one is swallowed.
+	// The error MUST travel: a swallowed rename made writeSnapshot report
+	// success while the disk kept the previous snapshot, and the final-flush
+	// guarantee died with it.
 	var renameErr error
 	for attempt := 0; attempt < 5; attempt++ {
 		renameErr = os.Rename(tmp, path)
 		if renameErr == nil {
 			break
 		}
-		if !errors.Is(renameErr, os.ErrPermission) {
-			break
-		}
 		time.Sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
 	}
 	if renameErr != nil {
 		_ = os.Remove(tmp)
-		return err
+		return renameErr
 	}
 	return nil
 }

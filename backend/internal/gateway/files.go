@@ -344,11 +344,15 @@ func (g *Gateway) FilesDelete(w http.ResponseWriter, r *http.Request) {
 // not exist" and "not yours" — a 404 keeps the registry from confirming
 // guesses about other keys' ids.
 func (g *Gateway) ownedFile(id string, key *store.ClientKey) (fileRecord, bool) {
+	return g.ownedByID(id, key.ID)
+}
+
+func (g *Gateway) ownedByID(id, owner string) (fileRecord, bool) {
 	record, ok := g.filesStore().get(id)
 	if !ok {
 		return fileRecord{}, false
 	}
-	if record.OwnerKey != "" && record.OwnerKey != key.ID {
+	if record.OwnerKey != "" && record.OwnerKey != owner {
 		return fileRecord{}, false
 	}
 	return record, true
@@ -358,10 +362,15 @@ func (g *Gateway) ownedFile(id string, key *store.ClientKey) (fileRecord, bool) 
 //
 // Both OpenAI spellings are accepted: a `file_id` referencing an earlier
 // /v1/files upload, or inline `file_data` as a data URL (the PDF-input shape).
-func (g *Gateway) resolveFilePart(part contentPart) (minimax.PendingAttachment, error) {
+func (g *Gateway) resolveFilePart(part contentPart, owner string) (minimax.PendingAttachment, error) {
 	store := g.filesStore()
 	if id := strings.TrimSpace(part.File.FileID); id != "" {
-		record, ok := store.get(id)
+		// Same ownership rule as the REST file endpoints. The REST surfaces
+		// were scoped to the uploading key when uploads became owned, and this
+		// path — the one that ships the bytes to the upstream and, through the
+		// model, back to the caller — is the prize a leaked key would go for.
+		// Legacy owner-less records stay visible to every key.
+		record, ok := g.ownedByID(id, owner)
 		if !ok {
 			return minimax.PendingAttachment{}, fmt.Errorf("unknown file_id %q", id)
 		}

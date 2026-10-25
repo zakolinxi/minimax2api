@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -70,7 +71,13 @@ func main() {
 	registerDebug(mux)
 	registerStatic(mux, cfg.StaticDir)
 
-	handler := withLogging(withCORS(mux))
+	// MaxConcurrentRequests has been a visible setting forever, but nothing
+	// ever read it: the console showed a number that did nothing. Wire it as a
+	// process-wide gate — without one, N client keys under no per-key limit
+	// can drive the memory-backed turn path (64MB bodies, in-memory
+	// attachments) into an OOM. Settings are re-read per request, so a console
+	// change takes effect without a restart.
+	handler := withRequestGate(st, withLogging(withCORS(mux)))
 	addr := st.Settings().Server.Addr
 	if cfg.Addr != "" {
 		addr = cfg.Addr
@@ -227,6 +234,55 @@ func withCORS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// withRequestGate caps how many requests the process works on at once. A
+// zero or negative setting means unlimited, matching how the per-key limits
+// read zero.
+func withRequestGate(st *store.Store, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		limit := st.Settings().Server.MaxConcurrentRequests
+		if limit <= 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		gate := semaFor(st, limit)
+		select {
+		case gate <- struct{}{}:
+			// Release through the same gate that admitted this request: a
+			// settings change swaps the channel, and draining a slot from the
+			// new one would leak the old gate's slot forever.
+			defer func() { <-gate }()
+			next.ServeHTTP(w, r)
+		default:
+			// A bounded wait would pile every queued request onto the same
+			// goroutine budget the gate exists to protect; an immediate 503
+			// with Retry-After is the honest answer at capacity.
+			w.Header().Set("retry-after", "1")
+			http.Error(w, "服务器繁忙，请稍后重试", http.StatusServiceUnavailable)
+			return
+		}
+	})
+}
+
+// semaFor returns the process-wide gate, rebuilding it when the configured
+// limit changes. Holders of the previous gate release into it (the handler
+// captures the channel), so a swap strands at most the in-flight requests'
+// slots in the retired gate until they finish.
+var (
+	gateMu   sync.Mutex
+	gateCap  int
+	gateChan chan struct{}
+)
+
+func semaFor(st *store.Store, limit int) chan struct{} {
+	gateMu.Lock()
+	defer gateMu.Unlock()
+	if gateChan == nil || gateCap != limit {
+		gateChan = make(chan struct{}, limit)
+		gateCap = limit
+	}
+	return gateChan
 }
 
 type statusWriter struct {

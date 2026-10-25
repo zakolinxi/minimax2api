@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"minimax2api/internal/config"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -457,5 +459,50 @@ func TestConsumeStreamFramesCRLF(t *testing.T) {
 	}
 	if result2.Text != "混合" {
 		t.Fatalf("mixed text = %q", result2.Text)
+	}
+}
+
+// A local proxy is a supported shape, and the proxy's own address is exempt
+// from the private-address check so the proxy connection can dial. That
+// exemption used to match on host alone: with a loopback proxy, every other
+// port on 127.0.0.1 was exempt too, and a reference URL like
+// http://127.0.0.1:<any port>/ walked straight back into the SSRF doorway.
+func TestDownloadClientLocalProxyExemptionIsScopedToTheProxyPort(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("secret local service"))
+	}))
+	defer target.Close()
+
+	settings := config.DefaultSettings(t.TempDir())
+	settings.Upstream.Proxy = "http://127.0.0.1:1" // a proxy port nothing answers on
+	settings.Security.AllowPrivateFetch = false
+
+	req, err := http.NewRequest(http.MethodGet, target.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = DownloadClient(settings).Do(req)
+	if !errors.Is(err, ErrPrivateAddress) {
+		t.Fatalf("err = %v, want ErrPrivateAddress — the exemption must not cover every port on the proxy's host", err)
+	}
+}
+
+// The proxy's own address and port remain exempt, so a proxy connection still
+// dials (verified up to the connection error, not a policy error).
+func TestDownloadClientStillDialsTheProxyItself(t *testing.T) {
+	settings := config.DefaultSettings(t.TempDir())
+	settings.Upstream.Proxy = "http://127.0.0.1:1"
+	settings.Security.AllowPrivateFetch = false
+
+	req, err := http.NewRequest(http.MethodGet, "http://example.invalid/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = DownloadClient(settings).Do(req)
+	if err == nil {
+		t.Fatal("expected a dial failure (nothing listens on the proxy port)")
+	}
+	if errors.Is(err, ErrPrivateAddress) {
+		t.Fatalf("the proxy's own address must be exempt from the private-address check: %v", err)
 	}
 }

@@ -268,10 +268,13 @@ type Client struct {
 	// proxyMu guards the lazily built proxied client. do() used to construct a
 	// fresh http.Client and Transport for every proxied request — a new TCP and
 	// TLS handshake per call and an idle pool nobody reused. The client is
-	// rebuilt only when the console changes the proxy address.
-	proxyMu     sync.Mutex
-	proxyClient *http.Client
-	proxyFor    string
+	// rebuilt only when the console changes the proxy address; the outgoing
+	// transport's idle connections are closed so the old address does not keep
+	// sockets open until they time out.
+	proxyMu        sync.Mutex
+	proxyClient    *http.Client
+	proxyTransport *http.Transport
+	proxyFor       string
 }
 
 // clock returns the client's time source. A zero-value Client is usable, which
@@ -579,8 +582,10 @@ func (c *Client) clientForProxy(raw string) (*http.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.proxyClient = &http.Client{
-		Transport: &http.Transport{
+	if c.proxyTransport != nil {
+		c.proxyTransport.CloseIdleConnections()
+	}
+	c.proxyTransport = &http.Transport{
 			Proxy: func(target *http.Request) (*url.URL, error) {
 				// Loopback never goes through the proxy.
 				//
@@ -601,8 +606,8 @@ func (c *Client) clientForProxy(raw string) (*http.Client, error) {
 			MaxIdleConns:        64,
 			MaxIdleConnsPerHost: 16,
 			IdleConnTimeout:     90 * time.Second,
-		},
-	}
+		}
+	c.proxyClient = &http.Client{Transport: c.proxyTransport}
 	c.proxyFor = raw
 	return c.proxyClient, nil
 }

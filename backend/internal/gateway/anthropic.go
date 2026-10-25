@@ -93,7 +93,8 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt, images, files, err := g.anthropicPrompt(r.Context(), request.System, request.Messages)
+	keep, _ := referenceLimit(model, countAnthropicReferences(request.Messages))
+	prompt, images, files, err := g.anthropicPrompt(r.Context(), request.System, request.Messages, keep, key.ID)
 	if err != nil {
 		writeAnthropicError(out, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -155,6 +156,7 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		OnDelta:      onDelta,
 		OnThinking:   onThinking,
 		Committed:    func() bool { return out.wroteHeader },
+		ResetStream:  splitter.reset,
 	})
 
 	promptTokens := estimateTokens(prompt)
@@ -295,7 +297,7 @@ func anthropicToolSpecs(tools []anthropicTool) []toolSpec {
 // anthropicPrompt flattens an Anthropic conversation the way buildPrompt
 // flattens an OpenAI one, so both front ends reach the upstream with the same
 // text for the same conversation.
-func (g *Gateway) anthropicPrompt(ctx context.Context, system json.RawMessage, messages []anthropicMessage) (string, []minimax.UploadedImage, []minimax.PendingAttachment, error) {
+func (g *Gateway) anthropicPrompt(ctx context.Context, system json.RawMessage, messages []anthropicMessage, imageCap int, owner string) (string, []minimax.UploadedImage, []minimax.PendingAttachment, error) {
 	var builder strings.Builder
 	var images []minimax.UploadedImage
 	var files []minimax.PendingAttachment
@@ -317,6 +319,9 @@ func (g *Gateway) anthropicPrompt(ctx context.Context, system json.RawMessage, m
 			}
 		}
 		for _, raw := range urls {
+			if imageCap >= 0 && len(images) >= imageCap {
+				break
+			}
 			image, err := g.resolveImage(ctx, raw)
 			if err != nil {
 				return "", nil, nil, err
@@ -324,7 +329,7 @@ func (g *Gateway) anthropicPrompt(ctx context.Context, system json.RawMessage, m
 			images = append(images, image)
 		}
 		for _, doc := range documents {
-			file, err := g.resolveFilePart(doc)
+			file, err := g.resolveFilePart(doc, owner)
 			if err != nil {
 				return "", nil, nil, err
 			}
@@ -350,6 +355,17 @@ func anthropicBlocksText(raw json.RawMessage) string {
 	}
 	text, _, _ := anthropicBlocks(raw)
 	return text
+}
+
+// countAnthropicReferences reports how many reference pictures an Anthropic
+// conversation carries, so the cap can be applied before anything downloads.
+func countAnthropicReferences(messages []anthropicMessage) int {
+	total := 0
+	for _, message := range messages {
+		_, urls, _ := anthropicBlocks(message.Content)
+		total += len(urls)
+	}
+	return total
 }
 
 // anthropicBlocks walks a content value and returns its text plus any image
