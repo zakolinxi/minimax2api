@@ -19,7 +19,6 @@ type Draft = {
   addr: string;
   maxConcurrentRequests: number;
   adminUsername: string;
-  adminPassword: string;
   baseURL: string;
   baseURLCN: string;
   streamBaseURL: string;
@@ -93,7 +92,6 @@ function toDraft(settings: SettingsDTO): Draft {
   const video = settings.video;
   return {
     ...settings.server,
-    adminPassword: "",
     ...settings.upstream,
     ...settings.routing,
     ...settings.audit,
@@ -224,7 +222,6 @@ export function SettingsPage() {
           defaultDuration: value.videoDefaultDuration,
           timeoutSec: value.videoTimeoutSec,
         },
-        ...(value.adminPassword ? { adminPassword: value.adminPassword } : {}),
       }),
     onSuccess: () => {
       toast.success(t("settings.saved"));
@@ -282,15 +279,6 @@ export function SettingsPage() {
           </Field>
           <Field label={t("settings.server.adminUsername")}>
             <Input value={draft.adminUsername} onChange={(event) => set("adminUsername", event.target.value)} />
-          </Field>
-          <Field label={t("settings.server.adminPassword")} help={t("settings.server.adminPasswordHelp")}>
-            <Input
-              type="password"
-              autoComplete="new-password"
-              value={draft.adminPassword}
-              placeholder="••••••••"
-              onChange={(event) => set("adminPassword", event.target.value)}
-            />
           </Field>
         </SettingsGroup>
 
