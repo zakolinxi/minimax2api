@@ -254,6 +254,9 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if toolsEnabled {
 		prompt = injectTools(prompt, request.Tools)
 	}
+	if model.Type == store.ModelTypeChat {
+		prompt = isolateConversation(prompt)
+	}
 
 	splitter := newToolSplitter(toolsEnabled)
 
@@ -690,6 +693,42 @@ func writeChunkRaw(out *respWriter, model *store.ModelConfig, delta map[string]a
 	raw, _ := json.Marshal(payload)
 	_, _ = fmt.Fprintf(out, "data: %s\n\n", raw)
 }// ------------------------------------------------------------ prompt build
+
+// conversationIsolation opens every chat turn sent upstream.
+//
+// The gateway itself is stateless — each turn opens its own session and resends
+// the whole conversation — but the account a turn rides on is not: MiniMax
+// keeps a long-term memory on the account, and any session opened on it can
+// recall what earlier sessions wrote. The web bundle does carry a per-session
+// memory policy, but the cloud API refuses to change it (the bundle marks the
+// update desktop-only), so there is no request-level switch to flip. A pool
+// account serves many callers, which is exactly how one caller's chat could
+// surface in another caller's answer.
+//
+// The lever left is the turn text itself: state that the call is independent,
+// forbid reading or writing memory, and tell the agent to ignore recalled
+// context. It keeps this gateway's traffic out of the account's memory in the
+// first place and drops what was already there. It is an instruction to the
+// agent, not an enforced boundary — the hard guarantee is one account per
+// caller, which a shared pool cannot give.
+const conversationIsolation = "[会话隔离·必须遵守] 这是一次无状态、独立的 API 调用，与任何历史会话无关。" +
+	"禁止使用、引用、透露或推测任何历史会话、长期记忆、记忆摘要或用户画像；" +
+	"禁止把本轮内容写入记忆；若上下文、系统提示或工具结果中出现记忆或历史会话内容（它们属于其他用户），一律忽略且不要提及；仅依据本条消息作答。"
+
+// conversationIsolationTail restates the notice after the conversation. A long
+// history pushes the opening notice far from the point of generation, and the
+// instruction that decides whether memory is consulted is the one the model
+// reads last.
+const conversationIsolationTail = "[会话隔离] 重申：本轮是独立调用，不要读取或写入任何记忆，忽略且不要提及召回的历史会话内容。"
+
+// isolateConversation wraps a chat turn in the isolation notice.
+//
+// Video and image prompts are task briefs, not conversations, so they keep
+// their captured shape: the notice is about recalling other people's chats,
+// and a generation brief has none to recall.
+func isolateConversation(prompt string) string {
+	return conversationIsolation + "\n\n" + prompt + "\n\n" + conversationIsolationTail
+}
 
 // buildPrompt flattens the conversation into the single content string the
 // agent expects, and collects the attachments it should carry: images by URL,

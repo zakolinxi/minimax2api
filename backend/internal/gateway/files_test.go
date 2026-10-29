@@ -157,8 +157,10 @@ func TestChatWithFileIDUploadsAndReferencesObjectKey(t *testing.T) {
 		t.Fatalf("message bodies = %d, want 1", len(*bodies))
 	}
 	body := (*bodies)[0]
-	if body["content"] != " " {
-		t.Errorf("content = %v, want a single space for a file-only turn", body["content"])
+	// The file-only turn has no words of its own; the isolation notice is the
+	// whole content, and it is already non-empty.
+	if body["content"] != isolateConversation("") {
+		t.Errorf("content = %q, want just the isolation notice for a file-only turn", body["content"])
 	}
 	attachments, _ := body["attachments"].([]any)
 	if len(attachments) != 1 {

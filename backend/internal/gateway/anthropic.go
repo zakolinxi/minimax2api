@@ -123,6 +123,7 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	settings := g.settings()
 	prompt = g.outgoingText(settings, model, prompt, minimax.VideoOptions{})
+	prompt = isolateConversation(prompt)
 
 	splitter := newToolSplitter(toolsEnabled)
 	stream := newAnthropicStream(out, model.ID, estimateTokens(prompt))

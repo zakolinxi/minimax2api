@@ -418,3 +418,29 @@ func TestRawJSONObjectRejectsInvalidJSON(t *testing.T) {
 		}
 	}
 }
+
+// The Claude front end rides the same pooled accounts as the OpenAI one, so it
+// must carry the same isolation notice: a turn must not read or write the
+// account's long-term memory.
+func TestAnthropicMessagesIsolatesConversationMemory(t *testing.T) {
+	var captured map[string]any
+	h := newHarness(t, captureUpstream(t, &captured))
+	h.addAccount(t, "a", "token-a", 0)
+
+	rec := h.anthropic(t, map[string]any{
+		"model":      "claude-sonnet-4-20250514",
+		"max_tokens": 256,
+		"messages":   []any{map[string]any{"role": "user", "content": "你好"}},
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	content, _ := captured["content"].(string)
+	if !strings.HasPrefix(content, conversationIsolation) {
+		t.Fatalf("turn does not open with the isolation notice: %.160q", content)
+	}
+	if !strings.Contains(content, "你好") {
+		t.Fatalf("caller text missing from the turn: %.240q", content)
+	}
+}

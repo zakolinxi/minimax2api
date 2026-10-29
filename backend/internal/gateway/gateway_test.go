@@ -356,6 +356,32 @@ func TestChatCompletionsReturnsOpenAIResponse(t *testing.T) {
 	}
 }
 
+// A chat turn must open with the isolation notice. The gateway's pool shares
+// upstream accounts, and an account carries long-term memory that a later
+// session of another caller can otherwise recall — the notice is the only lever
+// the cloud API leaves for that (see conversationIsolation).
+func TestChatCompletionsIsolatesConversationMemory(t *testing.T) {
+	var captured map[string]any
+	h := newHarness(t, captureUpstream(t, &captured))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-agent",
+		"messages": []any{map[string]any{"role": "user", "content": "我叫小明"}},
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	content, _ := captured["content"].(string)
+	if !strings.HasPrefix(content, conversationIsolation) {
+		t.Fatalf("turn does not open with the isolation notice: %.160q", content)
+	}
+	if !strings.Contains(content, "我叫小明") {
+		t.Fatalf("caller text missing from the turn: %.240q", content)
+	}
+}
+
 // Reasoning arrives on its own frame and must land in reasoning_content rather
 // than being concatenated into the answer.
 func TestChatCompletionsSeparatesReasoning(t *testing.T) {
@@ -1181,7 +1207,9 @@ func TestChatCompletionsLeavesChatModelsAlone(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	if len(*seen) != 1 || (*seen)[0] != "你好" {
+	// The isolation notice is the one addition a chat turn gets; anything else
+	// here means the video rewrite leaked into a conversation.
+	if len(*seen) != 1 || (*seen)[0] != isolateConversation("你好") {
 		t.Fatalf("chat prompt was rewritten: %v", *seen)
 	}
 }
