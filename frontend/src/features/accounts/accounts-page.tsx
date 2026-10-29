@@ -7,6 +7,7 @@ import {
   Download,
   FileUp,
   Globe,
+  KeyRound,
   Pencil,
   Plus,
   RefreshCw,
@@ -74,6 +75,7 @@ import {
   refreshAllQuota,
   refreshCredit,
   refreshQuota,
+  reloginAccount,
   runSignin,
   signinAccount,
   updateAccount,
@@ -104,6 +106,15 @@ type EditorState = {
   name: string;
   token: string;
   region: AccountRegionInput;
+  /**
+   * The login credential behind the automatic re-login. The password is
+   * write-only: the backend never returns it, so `hasPassword` is what the form
+   * shows, and leaving the field blank keeps the stored secret.
+   */
+  email: string;
+  password: string;
+  hasPassword: boolean;
+  autoLogin: boolean;
   group: string;
   remark: string;
   priority: number;
@@ -131,6 +142,10 @@ const EMPTY_EDITOR: EditorState = {
   name: "",
   token: "",
   region: "auto",
+  email: "",
+  password: "",
+  hasPassword: false,
+  autoLogin: false,
   group: "",
   remark: "",
   priority: 50,
@@ -293,6 +308,9 @@ export function AccountsPage() {
         name: state.name,
         token: state.token,
         region: state.region,
+        autoLogin: state.autoLogin,
+        ...(state.email.trim() ? { email: state.email.trim() } : {}),
+        ...(state.password ? { password: state.password } : {}),
         group: state.group || undefined,
         remark: state.remark || undefined,
         priority: state.priority,
@@ -317,6 +335,9 @@ export function AccountsPage() {
         // backend does when the field is omitted.
         ...(state.token ? { token: state.token } : {}),
         region: state.region,
+        autoLogin: state.autoLogin,
+        ...(state.email.trim() ? { email: state.email.trim() } : {}),
+        ...(state.password ? { password: state.password } : {}),
         group: state.group,
         remark: state.remark,
         priority: state.priority,
@@ -496,6 +517,15 @@ export function AccountsPage() {
     onError: (error) => toast.error(errorMessage(error)),
   });
 
+  const reloginMutation = useMutation({
+    mutationFn: (id: string) => reloginAccount(id),
+    onSuccess: () => {
+      toast.success(t("accounts.reloginDone"));
+      invalidate();
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
   const busy =
     batchMutation.isPending ||
     probeAllMutation.isPending ||
@@ -578,6 +608,10 @@ export function AccountsPage() {
       // blank; leaving it blank keeps the stored one.
       token: "",
       region: account.region,
+      email: account.email,
+      password: "",
+      hasPassword: account.hasPassword,
+      autoLogin: account.autoLogin,
       group: account.group,
       remark: account.remark,
       priority: account.priority,
@@ -1023,6 +1057,7 @@ export function AccountsPage() {
               onQuota={(id) => quotaMutation.mutate(id)}
               onSignin={(id) => signinOneMutation.mutate(id)}
               onCredit={(id) => creditMutation.mutate(id)}
+              onRelogin={(id) => reloginMutation.mutate(id)}
               onClearCooldown={(id) => batchMutation.mutate({ action: "clearCooldown", ids: [id] })}
               onToggleEnabled={(account) => toggleEnabledMutation.mutate(account)}
               onDelete={setDeleteTarget}
@@ -1074,6 +1109,45 @@ export function AccountsPage() {
                 options={regionOptions}
               />
               <p className="text-[11px] leading-5 text-muted-foreground">{t("accounts.regionHelp")}</p>
+            </div>
+
+            <div className="space-y-3 rounded-md border border-border/60 p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <Label htmlFor="account-auto-login">{t("accounts.autoLogin")}</Label>
+                  <p className="text-[11px] leading-5 text-muted-foreground">{t("accounts.autoLoginHelp")}</p>
+                </div>
+                <Checkbox
+                  id="account-auto-login"
+                  checked={editor.autoLogin}
+                  onCheckedChange={(checked) => setEditor((current) => ({ ...current, autoLogin: checked === true }))}
+                  aria-label={t("accounts.autoLogin")}
+                />
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="account-email">{t("accounts.loginEmail")}</Label>
+                  <Input
+                    id="account-email"
+                    value={editor.email}
+                    onChange={(event) => setEditor((current) => ({ ...current, email: event.target.value }))}
+                    placeholder="name@example.com"
+                    autoComplete="off"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="account-password">{t("accounts.loginPassword")}</Label>
+                  <Input
+                    id="account-password"
+                    type="password"
+                    value={editor.password}
+                    onChange={(event) => setEditor((current) => ({ ...current, password: event.target.value }))}
+                    placeholder={editor.hasPassword ? t("accounts.passwordStored") : ""}
+                    autoComplete="new-password"
+                  />
+                </div>
+              </div>
+              <p className="text-[11px] leading-5 text-muted-foreground">{t("accounts.loginCredentialHelp")}</p>
             </div>
 
             <div className="rounded-md border border-border/60">
@@ -1534,6 +1608,7 @@ function AccountsTable({
   onQuota,
   onSignin,
   onCredit,
+  onRelogin,
   onClearCooldown,
   onToggleEnabled,
   onDelete,
@@ -1550,6 +1625,7 @@ function AccountsTable({
   onQuota: (id: string) => void;
   onSignin: (id: string) => void;
   onCredit: (id: string) => void;
+  onRelogin: (id: string) => void;
   onClearCooldown: (id: string) => void;
   onToggleEnabled: (account: AccountDTO) => void;
   onDelete: (account: AccountDTO) => void;
@@ -1653,6 +1729,10 @@ function AccountsTable({
                   <DropdownMenuItem onClick={() => onCredit(account.id)}>
                     <Coins />
                     {t("accounts.refreshCredit")}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRelogin(account.id)}>
+                    <KeyRound />
+                    {t("accounts.reloginNow")}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => onQuota(account.id)}>
                     <RefreshCw />

@@ -1,3 +1,4 @@
+import { KeyRound } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
@@ -64,6 +65,22 @@ export function AccountNameCell({ account }: { account: AccountDTO }) {
       {account.remark ? (
         <p className="mt-0.5 truncate text-[10px] text-muted-foreground" title={account.remark}>
           {account.remark}
+        </p>
+      ) : null}
+      {account.autoLogin || account.lastLoginError ? (
+        <p
+          className={cn(
+            "mt-0.5 truncate text-[10px]",
+            account.lastLoginError ? "text-destructive" : "text-muted-foreground",
+          )}
+          title={account.lastLoginError || undefined}
+        >
+          <KeyRound className="mr-1 inline size-3 align-[-1px]" />
+          {account.lastLoginError
+            ? t("accounts.reloginFailed", { error: account.lastLoginError })
+            : hasInstant(account.lastLoginAt)
+              ? t("accounts.reloginLast", { time: formatRelative(account.lastLoginAt, i18n.language) })
+              : t("accounts.autoLogin")}
         </p>
       ) : null}
       <p className="mt-0.5 truncate text-[10px] text-muted-foreground">

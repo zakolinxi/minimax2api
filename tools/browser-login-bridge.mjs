@@ -9,6 +9,14 @@
  * `localStorage._token` over the Chrome DevTools Protocol. Once the token
  * appears it is handed back to the caller.
  *
+ * The same session can also sign in by itself: when POST /login carries
+ * `email` and `password`, the bridge drives the unified login page
+ * (account.minimax.io/unified-login) — fill the identifier, click Continue,
+ * fill the password, click Continue — and then reads the token the agent site
+ * sets after the redirect. That path exists so an expired pool can recover
+ * without an operator, and it degrades to a clear error when the page wants
+ * something only a human can do (a missing password to create, a captcha).
+ *
  * Zero third-party dependencies: only Node builtins and the global WebSocket
  * (Node 22). The CDP plumbing is inlined on purpose so this file is
  * self-contained and does not import tools/render.mjs.
@@ -16,6 +24,7 @@
  * HTTP surface (JSON everywhere), default http://127.0.0.1:8766
  *   GET    /health              -> {ok:true}
  *   POST   /login               -> {sessionId, target, chromePid}  (returns immediately)
+ *                                  body: {target?, proxy?, email?, password?}
  *   GET    /login/<sessionId>   -> {status:"pending"|"ok"|"timeout"|"error", ...}
  *   DELETE /login/<sessionId>   -> {cancelled:true}
  *
@@ -25,6 +34,7 @@
  *                                    paths for macOS/Windows/Linux, then google-chrome
  *                                    / chromium / chromium-browser on PATH)
  *   BRIDGE_LOGIN_TTL_SECONDS         login window, default 600
+ *   BRIDGE_AUTO_LOGIN_TTL_SECONDS    automated login budget, default 120
  *
  * Usage:
  *   node tools/browser-login-bridge.mjs --port 8766
@@ -43,6 +53,15 @@ const POLL_INTERVAL_MS = 1000;
 // startup a failure. Chrome normally opens it in well under a second.
 const CDP_WAIT_MS = 15000;
 const TOKEN_KEY = "_token";
+
+// The account site that owns the login form, per agent deployment. They are
+// separate deployments with separate account databases, so the host has to be
+// derived from the target the operator picked rather than hardcoded.
+const ACCOUNT_ORIGINS = {
+  "agent.minimax.io": "https://account.minimax.io",
+  "agent.minimaxi.com": "https://account.minimax.cn",
+};
+const LOGIN_PATH = "/unified-login";
 
 // Reads the JWT and the origin it was read from. localStorage is per-origin, so
 // the origin tells the caller which site actually produced the token.
@@ -76,6 +95,9 @@ function positiveInt(value, fallback) {
 const PORT = positiveInt(argValue("port") ?? process.env.BRIDGE_PORT, 8766);
 const HOST = "127.0.0.1";
 const TTL_MS = positiveInt(process.env.BRIDGE_LOGIN_TTL_SECONDS, 600) * 1000;
+// An automated login either finishes in seconds or is stuck on something a
+// human has to clear, so it gets a much shorter budget than the manual window.
+const AUTO_TTL_MS = positiveInt(process.env.BRIDGE_AUTO_LOGIN_TTL_SECONDS, 120) * 1000;
 
 // ---------------------------------------------------------------------------
 // State
@@ -428,6 +450,202 @@ async function connectCdp(debugPort, origin) {
 }
 
 // ---------------------------------------------------------------------------
+// Automated sign-in
+// ---------------------------------------------------------------------------
+
+/** The login form's home for one agent deployment. */
+function accountOriginFor(target) {
+  try {
+    return ACCOUNT_ORIGINS[new URL(target).hostname] || ACCOUNT_ORIGINS["agent.minimax.io"];
+  } catch {
+    return ACCOUNT_ORIGINS["agent.minimax.io"];
+  }
+}
+
+const IDENTIFIER_SELECTOR =
+  'input[type="email"], input[type="tel"], input[name*="email" i], input[name*="phone" i]';
+
+const PAGE_STATE_EXPR = `(() => ({
+  url: location.href,
+  origin: (() => { try { return location.origin; } catch (e) { return ""; } })(),
+  hasIdentifier: !!document.querySelector(${JSON.stringify(IDENTIFIER_SELECTOR)}),
+  hasPassword: !!document.querySelector('input[type="password"]'),
+  text: (document.body && document.body.innerText ? document.body.innerText : "").slice(0, 300),
+  token: (() => { try { return localStorage.getItem(${JSON.stringify(TOKEN_KEY)}); } catch (e) { return null; } })(),
+}))()`;
+
+// React owns these inputs and ignores a plain `.value =` assignment, so the
+// value goes in through the prototype setter and then announces itself as a
+// real edit. Same trick the site's own autofill produces.
+function fillExpr(selector, value) {
+  return `(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) return false;
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+    el.focus();
+    setter.call(el, ${JSON.stringify(value)});
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  })()`;
+}
+
+// The page says Continue (or 继续/下一步 on the mainland site). Falling back to
+// a form submit keeps the driver working if the button is rendered as a link.
+const CLICK_CONTINUE_EXPR = `(() => {
+  const labels = ["Continue", "continue", "继续", "下一步", "Next"];
+  const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+  const hit = buttons.find((b) => {
+    const text = (b.textContent || "").trim();
+    return text && labels.some((label) => text.startsWith(label)) && !b.disabled;
+  });
+  if (hit) { hit.click(); return true; }
+  const form = document.querySelector("form");
+  if (form) { form.requestSubmit(); return true; }
+  return false;
+})()`;
+
+/**
+ * Drives the unified login form with the credentials the session carries.
+ *
+ * Runs beside the token poll, which owns the success signal: this function only
+ * needs to get the page to the agent site and turn a stuck form into an error
+ * the caller can show. Every browser step re-checks `session.status` because a
+ * human may cancel, or the poll may already have found a token, at any moment.
+ */
+async function runAutoLogin(session) {
+  const agentOrigin = originOf(session.target);
+  const credentials = session.credentials;
+  const deadline = Math.min(session.deadline, Date.now() + AUTO_TTL_MS);
+
+  const fail = (message) => {
+    delete session.credentials;
+    if (session.status !== "pending") return;
+    session.status = "error";
+    session.error = message;
+    destroySession(session);
+    console.log(`[bridge] ${session.id} auto-login failed: ${message}`);
+  };
+
+  const ensureCdp = async () => {
+    if (session.cdp && session.cdp.closed) session.cdp = null;
+    if (!session.cdp) session.cdp = await connectCdp(session.debugPort, agentOrigin);
+    return session.cdp;
+  };
+
+  const readPage = async () => {
+    if (!(await ensureCdp())) return null;
+    try {
+      return await evaluate(session.cdp, PAGE_STATE_EXPR);
+    } catch {
+      // Navigation replaced the execution context; reconnect on the next read.
+      try {
+        session.cdp.close();
+      } catch {
+        /* ignore */
+      }
+      session.cdp = null;
+      return null;
+    }
+  };
+
+  const waitFor = async (predicate, timeoutMs) => {
+    const until = Math.min(deadline, Date.now() + timeoutMs);
+    while (Date.now() < until) {
+      if (session.status !== "pending") return null;
+      const state = await readPage();
+      if (state && predicate(state)) return state;
+      await sleep(500);
+    }
+    return null;
+  };
+
+  try {
+    // The profile is shared between logins and may still be signed in as a
+    // DIFFERENT account. Both halves of that session have to go before the form
+    // is touched: the cookies keep the login page from ever showing, and the
+    // agent site's stored token would otherwise be picked up by the poll loop
+    // as if this login had produced it — handing the caller the wrong account.
+    if (await ensureCdp()) {
+      try {
+        // Sign out of whatever the profile remembered. Cookies are the session;
+        // the account site's own localStorage is left alone so the fingerprint
+        // it keeps stable across logins does not churn and look like a new
+        // device to the site's risk control.
+        await session.cdp.send("Network.clearBrowserCookies");
+        // The agent site's `_token` is what the poll loop reads, so it has to
+        // go before the form is touched.
+        await session.cdp.send("Storage.clearDataForOrigin", {
+          origin: agentOrigin,
+          storageTypes: "local_storage",
+        });
+      } catch {
+        /* the domains are not always available; the form still works */
+      }
+      try {
+        await session.cdp.send("Page.navigate", { url: `${accountOrigin}${LOGIN_PATH}` });
+      } catch {
+        /* a dead socket is handled by the wait below */
+      }
+    }
+    // From here on a `_token` can only be one this login produced: the stale
+    // copy is already gone, so let the poll loop start believing what it reads.
+    session.armed = true;
+
+    const opened = await waitFor(
+      (state) => state.origin === agentOrigin || state.hasIdentifier || state.hasPassword,
+      20000,
+    );
+    if (!opened) {
+      const last = await readPage();
+      return fail(`login page did not render${last && last.text ? `: ${last.text}` : ""}`);
+    }
+    if (opened.origin === agentOrigin) return; // already signed in; poll loop owns it
+
+    if (!opened.hasPassword) {
+      if (!opened.hasIdentifier) return fail(`login page: ${opened.text}`);
+      if (!(await evaluate(session.cdp, fillExpr(IDENTIFIER_SELECTOR, credentials.email)))) {
+        return fail("login page has no identifier field");
+      }
+      if (!(await evaluate(session.cdp, CLICK_CONTINUE_EXPR))) {
+        return fail("login page has no continue button");
+      }
+    }
+
+    const passwordStep = await waitFor((state) => state.hasPassword, 20000);
+    if (!passwordStep) {
+      const last = await readPage();
+      // The page falls back to "create a password" (email code) for accounts
+      // that never set one, and to a captcha when it does not trust the
+      // session. Neither is something this driver can answer.
+      return fail(`no password step${last && last.text ? `: ${last.text}` : ""}`);
+    }
+    if (!(await evaluate(session.cdp, fillExpr('input[type="password"]', credentials.password)))) {
+      return fail("password field disappeared");
+    }
+    if (!(await evaluate(session.cdp, CLICK_CONTINUE_EXPR))) {
+      return fail("no continue button on the password step");
+    }
+    delete session.credentials;
+
+    // The redirect back to the agent site is the finish line. The poll loop
+    // picks the token up; this waits only long enough to report a refusal with
+    // the page's own words instead of an opaque timeout.
+    const landed = await waitFor(
+      (state) => state.origin === agentOrigin,
+      Math.max(1000, Math.min(30000, deadline - Date.now())),
+    );
+    if (landed) return;
+    const last = await readPage();
+    if (last && last.origin === agentOrigin) return;
+    return fail(`login did not complete${last && last.text ? `: ${last.text}` : ""}`);
+  } catch (error) {
+    fail(`auto login crashed: ${error.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
@@ -448,6 +666,8 @@ function stopPolling(session) {
 
 function destroySession(session) {
   stopPolling(session);
+  // Credentials live only as long as the browser session that is using them.
+  delete session.credentials;
   const proc = session.chromeProc;
   session.chromeProc = null;
   session.userDataDir = null;
@@ -498,10 +718,15 @@ async function runPollLoop(session) {
     if (session.status !== "pending") return;
 
     const token = value && typeof value.token === "string" ? value.token.trim() : "";
-    if (token) {
+    // An automated session starts disarmed: until the driver has cleared the
+    // profile's previous session, a token in localStorage belongs to whoever
+    // was signed in before, not to the account this login is for.
+    if (token && !(session.auto && !session.armed)) {
       session.status = "ok";
       session.token = token;
       session.host = value.origin || origin;
+      // The credential has done its job; the session only needs the token now.
+      delete session.credentials;
       stopPolling(session);
       // Never log the token itself, only its length.
       console.log(`[bridge] ${session.id} ok host=${session.host} tokenLength=${token.length}`);
@@ -592,6 +817,18 @@ async function handleLogin(req, res) {
   const proxy =
     typeof parsed.proxy === "string" && parsed.proxy.trim() ? parsed.proxy : "";
 
+  // Credentials turn the session into an automated sign-in. The password is
+  // kept in memory only, never logged, and dropped as soon as it is typed.
+  const email = typeof parsed.email === "string" || typeof parsed.identifier === "string"
+    ? String(parsed.email ?? parsed.identifier).trim()
+    : "";
+  const password = typeof parsed.password === "string" ? parsed.password : "";
+  if ((email && !password) || (!email && password)) {
+    sendJson(res, 400, { error: "email and password must be supplied together" });
+    return;
+  }
+  const auto = Boolean(email && password);
+
   const chrome = findChrome();
   if (!chrome) {
     sendJson(res, 500, {
@@ -628,6 +865,10 @@ async function handleLogin(req, res) {
   }
   const userDataDir = PROFILE_DIR;
 
+  // Automated sessions open the account site's login form; manual ones open the
+  // agent site and wait for the operator to sign in there.
+  const openUrl = auto ? `${accountOriginFor(target)}${LOGIN_PATH}` : target;
+
   const args = [
     `--remote-debugging-port=${debugPort}`,
     ...(proxy ? [`--proxy-server=${proxy}`] : []),
@@ -635,7 +876,7 @@ async function handleLogin(req, res) {
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-extensions",
-    target,
+    openUrl,
   ];
 
   // Reserve the profile synchronously for the whole startup window so a
@@ -683,13 +924,18 @@ async function handleLogin(req, res) {
     error: null,
     cdp: null,
     timer: null,
+    auto,
+    // Manual sessions are always trustworthy: there is no form driver that has
+    // to clean up first. See the poll loop and runAutoLogin.
+    armed: !auto,
+    credentials: auto ? { email, password } : null,
     createdAt: Date.now(),
     deadline: Date.now() + TTL_MS,
   };
   sessions.set(id, session);
 
   console.log(
-    `[bridge] ${id} started target=${target}${proxy ? ` proxy=${proxy}` : ""} chromePid=${chromeProc.pid} debugPort=${debugPort} ttl=${Math.round(TTL_MS / 1000)}s`,
+    `[bridge] ${id} started target=${target}${auto ? " auto=1" : ""}${proxy ? ` proxy=${proxy}` : ""} chromePid=${chromeProc.pid} debugPort=${debugPort} ttl=${Math.round(TTL_MS / 1000)}s`,
   );
 
   runPollLoop(session).catch((error) => {
@@ -699,8 +945,17 @@ async function handleLogin(req, res) {
     destroySession(session);
     console.log(`[bridge] ${id} error ${error.message}`);
   });
+  if (auto) {
+    runAutoLogin(session).catch((error) => {
+      if (session.status !== "pending") return;
+      session.status = "error";
+      session.error = error.message;
+      destroySession(session);
+      console.log(`[bridge] ${id} auto-login error ${error.message}`);
+    });
+  }
 
-  sendJson(res, 200, { sessionId: id, target, chromePid: chromeProc.pid });
+  sendJson(res, 200, { sessionId: id, target, chromePid: chromeProc.pid, auto });
 }
 
 function handleGetLogin(res, id) {

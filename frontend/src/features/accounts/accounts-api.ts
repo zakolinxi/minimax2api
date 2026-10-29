@@ -78,6 +78,16 @@ export type AccountDTO = {
   region: AccountRegion;
   userId: string;
   identifier: string;
+  /**
+   * Login credential used by the automatic re-login. `hasPassword` is projected
+   * instead of the password itself: the console never receives the secret, so
+   * an edit form can only replace it, never show it.
+   */
+  email: string;
+  hasPassword: boolean;
+  autoLogin: boolean;
+  lastLoginAt: string;
+  lastLoginError: string;
   agentID: string;
   deviceID: string;
   uuid: string;
@@ -163,6 +173,10 @@ export type AccountInput = {
   name?: string;
   token?: string;
   region?: AccountRegionInput;
+  /** Login credential for the automatic re-login; omitted password keeps it. */
+  email?: string;
+  password?: string;
+  autoLogin?: boolean;
   userId?: string;
   agentID?: string;
   deviceID?: string;
@@ -316,6 +330,14 @@ export function signinAccount(id: string): Promise<{ result: SigninAccountResult
 
 export function refreshCredit(id: string): Promise<{ credit: AccountCredit; account: AccountDTO }> {
   return apiRequest(`/admin/api/accounts/${id}/credit`, { method: "POST" });
+}
+
+/**
+ * Signs the account in again through the local browser login bridge, using the
+ * stored email/password, and returns the refreshed account.
+ */
+export function reloginAccount(id: string): Promise<{ account: AccountDTO }> {
+  return apiRequest(`/admin/api/accounts/${id}/relogin`, { method: "POST" });
 }
 
 // ------------------------------------------------------------ browser sign-in

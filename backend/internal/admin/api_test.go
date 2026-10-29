@@ -786,3 +786,28 @@ func TestDashboardDropsFakeUsageFields(t *testing.T) {
 		}
 	}
 }
+
+// An export is a file operators copy around, so the password must not travel
+// with it even though the login email and the switch do.
+func TestExportNeverCarriesThePassword(t *testing.T) {
+	api, st := newTestAPI(t)
+	account := addAccount(t, st, map[string]any{"user_id": "1"}, "")
+	_, _ = st.UpdateAccount(account.ID, func(target *store.Account) {
+		target.Email = "login@example.com"
+		target.Password = "test-password"
+		target.AutoLogin = true
+	})
+
+	rec := httptest.NewRecorder()
+	api.exportAccounts(rec, httptest.NewRequest("GET", "/admin/api/accounts/export", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "hunter2") {
+		t.Fatalf("the password leaked into the export: %s", body)
+	}
+	if !strings.Contains(body, `"login@example.com"`) || !strings.Contains(body, `"autoLogin":true`) {
+		t.Fatalf("the export dropped the login settings it is meant to carry: %s", body)
+	}
+}

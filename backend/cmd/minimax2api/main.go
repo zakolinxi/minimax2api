@@ -98,6 +98,9 @@ func main() {
 	runCtx, stopRun := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopRun()
 	signinSvc.Start(runCtx)
+	// Accounts with a stored login credential refresh their own token before it
+	// expires; the loop is a no-op when no browser login bridge is configured.
+	api.StartAutoLogin(runCtx)
 
 	go func() {
 		log.Printf("MiniMax2API %s 已启动 · 管理台 http://%s · 数据目录 %s", gateway.Version, displayAddr(addr), cfg.DataDir)

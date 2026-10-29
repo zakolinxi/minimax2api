@@ -143,6 +143,24 @@ type Account struct {
 	// Identifier is a best-effort email or phone number decoded from the token,
 	// used to tell accounts apart in the console.
 	Identifier string `json:"identifier"`
+	// Email and Password are the login credential the automatic re-login uses
+	// when Token expires. The token is what every request rides on; these exist
+	// so an expiry does not need an operator with a browser.
+	//
+	// Password is stored as-is in the state file, for the same reason Token is:
+	// app.json is secret material already, and a ciphertext whose key has to sit
+	// beside it protects nothing. It is never projected into an API view and
+	// never written into an export — see AccountView and exportAccounts.
+	Email    string `json:"email,omitempty"`
+	Password string `json:"password,omitempty"`
+	// AutoLogin lets the background loop re-login the account when its token is
+	// invalid or close to expiry. Off unless the operator opted in.
+	AutoLogin bool `json:"autoLogin,omitempty"`
+	// LastLoginAt is the last automatic re-login attempt, successful or not, so
+	// a broken password cannot turn into a request loop. LastLoginError is the
+	// reason the last attempt failed; empty after a success.
+	LastLoginAt    time.Time `json:"lastLoginAt,omitempty"`
+	LastLoginError string    `json:"lastLoginError,omitempty"`
 	// AgentID pins the account to a specific agent; empty means use the global
 	// default.
 	AgentID string `json:"agentID"`
@@ -189,31 +207,36 @@ type Account struct {
 // AccountView is the API representation. It is an explicit projection rather
 // than an embedded struct so the raw token can never be serialised by accident.
 type AccountView struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	Kind          string    `json:"kind"`
-	Region        string    `json:"region"`
-	UserID        string    `json:"userId"`
-	Identifier    string    `json:"identifier"`
-	AgentID       string    `json:"agentID"`
-	DeviceID      string    `json:"deviceID"`
-	UUID          string    `json:"uuid"`
-	ScreenWidth   int       `json:"screenWidth"`
-	ScreenHeight  int       `json:"screenHeight"`
-	BaseURL       string    `json:"baseURL"`
-	Group         string    `json:"group"`
-	Remark        string    `json:"remark"`
-	Enabled       bool      `json:"enabled"`
-	Priority      int       `json:"priority"`
-	MaxConcurrent int       `json:"maxConcurrent"`
-	Status        string    `json:"status"`
-	CooldownUntil time.Time `json:"cooldownUntil"`
-	FailCount     int       `json:"failCount"`
-	SuccessCount  int       `json:"successCount"`
-	LastUsedAt    time.Time `json:"lastUsedAt"`
-	LastError     string    `json:"lastError"`
-	CreatedAt     time.Time `json:"createdAt"`
-	UpdatedAt     time.Time `json:"updatedAt"`
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	Kind           string    `json:"kind"`
+	Region         string    `json:"region"`
+	UserID         string    `json:"userId"`
+	Identifier     string    `json:"identifier"`
+	Email          string    `json:"email"`
+	HasPassword    bool      `json:"hasPassword"`
+	AutoLogin      bool      `json:"autoLogin"`
+	LastLoginAt    time.Time `json:"lastLoginAt"`
+	LastLoginError string    `json:"lastLoginError"`
+	AgentID        string    `json:"agentID"`
+	DeviceID       string    `json:"deviceID"`
+	UUID           string    `json:"uuid"`
+	ScreenWidth    int       `json:"screenWidth"`
+	ScreenHeight   int       `json:"screenHeight"`
+	BaseURL        string    `json:"baseURL"`
+	Group          string    `json:"group"`
+	Remark         string    `json:"remark"`
+	Enabled        bool      `json:"enabled"`
+	Priority       int       `json:"priority"`
+	MaxConcurrent  int       `json:"maxConcurrent"`
+	Status         string    `json:"status"`
+	CooldownUntil  time.Time `json:"cooldownUntil"`
+	FailCount      int       `json:"failCount"`
+	SuccessCount   int       `json:"successCount"`
+	LastUsedAt     time.Time `json:"lastUsedAt"`
+	LastError      string    `json:"lastError"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 	// No omitempty: the console declares quota as a required field that may be
 	// null, so the key must always be present. Omitting it would make the
 	// property undefined instead of null and silently break strict checks.
@@ -238,8 +261,12 @@ type AccountView struct {
 func NewAccountView(account *Account, inflight int) AccountView {
 	return AccountView{
 		ID: account.ID, Name: account.Name, Kind: account.Kind, Region: account.Region,
-		UserID: account.UserID, Identifier: account.Identifier, AgentID: account.AgentID,
-		DeviceID: account.DeviceID, UUID: account.UUID,
+		UserID: account.UserID, Identifier: account.Identifier,
+		Email: account.Email, HasPassword: account.Password != "",
+		AutoLogin: account.AutoLogin, LastLoginAt: account.LastLoginAt,
+		LastLoginError: account.LastLoginError,
+		AgentID:        account.AgentID,
+		DeviceID:       account.DeviceID, UUID: account.UUID,
 		ScreenWidth: account.ScreenWidth, ScreenHeight: account.ScreenHeight,
 		BaseURL: account.BaseURL, Group: account.Group, Remark: account.Remark,
 		Enabled: account.Enabled, Priority: account.Priority,
