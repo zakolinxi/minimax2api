@@ -84,6 +84,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	route("POST", "/admin/api/accounts/{id}/quota", a.guard(a.refreshQuota))
 	route("POST", "/admin/api/accounts/{id}/signin", a.guard(a.signinAccount))
 	route("POST", "/admin/api/accounts/{id}/credit", a.guard(a.refreshCredit))
+	route("POST", "/admin/api/accounts/{id}/relogin", a.guard(a.reloginAccount))
 
 	route("GET", "/admin/api/signin", a.guard(a.signinOverview))
 	route("POST", "/admin/api/signin/run", a.guard(a.signinRun))
@@ -642,9 +643,14 @@ func (a *API) accountGroups(w http.ResponseWriter, r *http.Request) {
 }
 
 type accountPayload struct {
-	Name          string `json:"name"`
-	Token         string `json:"token"`
-	Region        string `json:"region"`
+	Name   string `json:"name"`
+	Token  string `json:"token"`
+	Region string `json:"region"`
+	// Email and Password are the login credential behind AutoLogin. The password
+	// is write-only: an omitted or empty value keeps what is stored.
+	Email         string `json:"email"`
+	Password      string `json:"password"`
+	AutoLogin     *bool  `json:"autoLogin"`
 	UserID        string `json:"userId"`
 	Identifier    string `json:"identifier"`
 	AgentID       string `json:"agentID"`
@@ -752,9 +758,16 @@ func buildAccount(payload accountPayload) (*store.Account, error) {
 		name = defaultAccountName(identifier, region)
 	}
 
+	email := strings.TrimSpace(payload.Email)
+	autoLogin := payload.AutoLogin != nil && *payload.AutoLogin
+	if err := checkLoginCredential(email, payload.Password, autoLogin); err != nil {
+		return nil, err
+	}
+
 	return &store.Account{
 		Name: name, Kind: firstNonEmpty(payload.Kind, store.KindToken),
 		Region: region, Token: token, UserID: userID, Identifier: identifier,
+		Email: email, Password: payload.Password, AutoLogin: autoLogin,
 		AgentID:  strings.TrimSpace(payload.AgentID),
 		DeviceID: deviceID, UUID: uuid,
 		ScreenWidth: payload.ScreenWidth, ScreenHeight: payload.ScreenHeight,
@@ -765,6 +778,23 @@ func buildAccount(payload accountPayload) (*store.Account, error) {
 		Priority:      clampInt(firstNonZero(payload.Priority, 50), 1, 100),
 		MaxConcurrent: clampInt(firstNonZero(payload.MaxConcurrent, 2), 1, 256),
 	}, nil
+}
+
+// checkLoginCredential keeps an account from being switched into a mode it
+// cannot honour. Auto-login is a promise the background loop makes to the pool:
+// an account flagged for it without a usable credential would sit invalid and
+// look like the loop is broken.
+func checkLoginCredential(email, password string, autoLogin bool) error {
+	if !autoLogin {
+		return nil
+	}
+	if strings.TrimSpace(email) == "" {
+		return errors.New("开启自动重登需要填写登录邮箱或手机号")
+	}
+	if password == "" {
+		return errors.New("开启自动重登需要填写登录密码")
+	}
+	return nil
 }
 
 // newUUID produces the value the site keeps in `localStorage.UNIQUE_USER_ID`.
@@ -860,10 +890,41 @@ func (a *API) updateAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The auto-login triple is validated against what the update would leave
+	// behind, not the payload alone: "switch it on" without a stored password
+	// is a well-formed request that could never work.
+	if current, ok := a.store.AccountByID(id); ok {
+		nextEmail, nextPassword, nextAuto := current.Email, current.Password, current.AutoLogin
+		if email := strings.TrimSpace(payload.Email); email != "" {
+			nextEmail = email
+		}
+		if payload.Password != "" {
+			nextPassword = payload.Password
+		}
+		if payload.AutoLogin != nil {
+			nextAuto = *payload.AutoLogin
+		}
+		if err := checkLoginCredential(nextEmail, nextPassword, nextAuto); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
 	tokenReplaced := false
 	account, err := a.store.UpdateAccount(id, func(account *store.Account) {
 		if strings.TrimSpace(payload.Name) != "" {
 			account.Name = strings.TrimSpace(payload.Name)
+		}
+		if email := strings.TrimSpace(payload.Email); email != "" {
+			account.Email = email
+		}
+		// A password is a secret the console never receives back, so an empty
+		// field means "unchanged" rather than "erase it".
+		if payload.Password != "" {
+			account.Password = payload.Password
+		}
+		if payload.AutoLogin != nil {
+			account.AutoLogin = *payload.AutoLogin
 		}
 		if token := strings.TrimSpace(payload.Token); token != "" && token != account.Token {
 			tokenReplaced = true
@@ -1096,6 +1157,7 @@ func (a *API) importAccounts(w http.ResponseWriter, r *http.Request) {
 		account, err := buildAccount(accountPayload{
 			Name: entry.Name, Token: entry.Token,
 			Region: importRegion,
+			Email:  entry.Email, Password: entry.Password, AutoLogin: entry.AutoLogin,
 			UserID: entry.UserID, Identifier: entry.Identifier, AgentID: entry.AgentID,
 			DeviceID: entry.DeviceID, UUID: entry.UUID,
 			ScreenWidth: entry.ScreenWidth, ScreenHeight: entry.ScreenHeight,
@@ -1114,6 +1176,18 @@ func (a *API) importAccounts(w http.ResponseWriter, r *http.Request) {
 			// so an existing entry is updated rather than rejected.
 			_, err := a.store.UpdateAccount(existing.ID, func(target *store.Account) {
 				target.Token = account.Token
+				// Login credentials travel only when the import record carries
+				// them: an export never contains the password, so a round trip
+				// through one must not erase the credential it could not carry.
+				if account.Email != "" {
+					target.Email = account.Email
+				}
+				if account.Password != "" {
+					target.Password = account.Password
+				}
+				if entry.AutoLogin != nil {
+					target.AutoLogin = *entry.AutoLogin
+				}
 				// A region only travels here when the import record named one.
 				// Overwriting unconditionally used to let a region-less
 				// re-import stomp the operator's manual region with the token's
@@ -1172,11 +1246,16 @@ func describeToken(token string) string {
 }
 
 type importEntry struct {
-	Name          string `json:"name"`
-	Token         string `json:"token"`
-	Region        string `json:"region"`
-	Kind          string `json:"kind"`
-	Enabled       *bool  `json:"enabled"`
+	Name     string `json:"name"`
+	Token    string `json:"token"`
+	Region   string `json:"region"`
+	Kind     string `json:"kind"`
+	Enabled  *bool  `json:"enabled"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	// AutoLogin is a pointer so an import that says nothing about it leaves the
+	// stored switch alone, the same way Enabled behaves.
+	AutoLogin     *bool  `json:"autoLogin"`
 	UserID        string `json:"userId"`
 	Identifier    string `json:"identifier"`
 	AgentID       string `json:"agentID"`
@@ -1316,6 +1395,11 @@ func (a *API) exportAccounts(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]any{
 			"name": account.Name, "token": account.Token, "region": account.Region,
 			"kind": kind, "enabled": account.Enabled,
+			// The login email and the auto-login switch travel so a rebuilt pool
+			// keeps its recovery setting; the password does not, because an
+			// export is a file operators pass around and a password is not a
+			// credential the export has any business carrying.
+			"email": account.Email, "autoLogin": account.AutoLogin,
 			"userId": account.UserID, "identifier": account.Identifier,
 			"agentID": account.AgentID, "deviceID": account.DeviceID, "uuid": account.UUID,
 			"screenWidth": account.ScreenWidth, "screenHeight": account.ScreenHeight,
