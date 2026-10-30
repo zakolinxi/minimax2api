@@ -42,7 +42,7 @@
 
 import http from "node:http";
 import net from "node:net";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -62,6 +62,8 @@ const ACCOUNT_ORIGINS = {
   "agent.minimaxi.com": "https://account.minimax.cn",
 };
 const LOGIN_PATH = "/unified-login";
+const MAILBOX_DB = (process.env.BRIDGE_MAILBOX_DB || "").trim();
+const MAILBOX_SQLITE = (process.env.BRIDGE_MAILBOX_SQLITE || "sqlite3").trim();
 
 // Reads the JWT and the origin it was read from. localStorage is per-origin, so
 // the origin tells the caller which site actually produced the token.
@@ -506,6 +508,162 @@ const CLICK_CONTINUE_EXPR = `(() => {
   return false;
 })()`;
 
+// The unified login form refuses to advance until the terms checkbox above the
+// legal text is ticked. It renders as a bare <button> next to the "I have read
+// and agree" paragraph with no role or aria state, so the driver clicks it once
+// per fresh render before pressing Continue.
+const CLICK_TERMS_EXPR = `(() => {
+  const p = Array.from(document.querySelectorAll("p")).find((el) => {
+    const text = (el.textContent || "").trim();
+    return (text.includes("I have read and agree") || text.includes("同意")) && el.parentElement && el.parentElement.querySelector("button");
+  });
+  if (!p) return false;
+  p.parentElement.querySelector("button").click();
+  return true;
+})()`;
+
+// The agent site's Sign in button is the only door that hands the account
+// site a login_redirect (oauth2 authorize + callback). Without it the login
+// succeeds but the exchange that produces the agent token never happens.
+const CLICK_SIGN_IN_EXPR = `(() => {
+  const b = Array.from(document.querySelectorAll('button, a, [role="button"]')).find((x) => {
+    const text = (x.textContent || "").trim();
+    return text === "Sign in" || text === "登录";
+  });
+  if (!b) return false;
+  b.click();
+  return true;
+})()`;
+
+// --- Email-code sign-in ------------------------------------------------------
+
+// The mailbox is a plain SQLite database fed by the deployment's mail sink;
+// asking it through the sqlite3 CLI keeps this file dependency-free.
+function mailboxCode(email, sinceEpoch) {
+  const [local, domain] = String(email || "").split("@");
+  if (!local || !domain) return null;
+  const esc = (v) => v.replace(/'/g, "''");
+  try {
+    const out = execFileSync(
+      MAILBOX_SQLITE,
+      [
+        MAILBOX_DB,
+        `SELECT code FROM messages WHERE lower(local)=lower('${esc(local)}') AND lower(domain)=lower('${esc(domain)}') AND code IS NOT NULL AND created > ${Math.floor(sinceEpoch)} ORDER BY created DESC LIMIT 1;`,
+      ],
+      { encoding: "utf-8", timeout: 8000 },
+    ).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+async function buttonPoint(cdp, label) {
+  const quoted = JSON.stringify(label);
+  return evaluate(cdp, `(() => {
+    const b = Array.from(document.querySelectorAll("button")).find((x) => (x.textContent || "").trim() === ${quoted});
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) return null;
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  })()`);
+}
+
+async function clickPoint(cdp, point) {
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x: point.x,
+    y: point.y,
+    button: "left",
+    clickCount: 1,
+  });
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x: point.x,
+    y: point.y,
+    button: "left",
+    clickCount: 1,
+  });
+}
+
+async function codeInputPoint(cdp) {
+  return evaluate(cdp, `(() => {
+    const el = Array.from(document.querySelectorAll("input")).find((x) =>
+      x.type !== "hidden" && x.type !== "password" && x.type !== "email" &&
+      x.offsetParent !== null && x.getBoundingClientRect().width > 0);
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  })()`);
+}
+
+// Signs in with the emailed one-time code. Returns "" on success (the token
+// poll loop owns the finish line) or a human-readable failure.
+async function emailCodeLogin(session, email) {
+  const cdp = session.cdp;
+  if (!cdp) return "code sign-in: browser connection lost";
+  if (!email) return "code sign-in: the account has no email";
+  if (!MAILBOX_DB) return "code sign-in: BRIDGE_MAILBOX_DB is not configured";
+  const deadline = Math.min(session.deadline, Date.now() + AUTO_TTL_MS);
+  // Codes live five minutes upstream, so a slightly older one is still usable.
+  const since = Math.floor(Date.now() / 1000) - 300;
+
+  let input = await codeInputPoint(cdp);
+  if (!input) {
+    const option = await buttonPoint(cdp, "Use email verification code");
+    if (!option) return "code sign-in: the form has no email-code option";
+    // The send is captcha-scored and can be refused for a moment; a second
+    // click a little later catches windows where the first one loses.
+    for (let attempt = 0; attempt < 2 && !input; attempt++) {
+      if (session.status !== "pending") return "";
+      await clickPoint(cdp, option);
+      for (let i = 0; i < 25 && !input; i++) {
+        await sleep(1000);
+        if (session.status !== "pending") return "";
+        input = await codeInputPoint(cdp);
+      }
+    }
+  }
+  if (!input) return "code sign-in: the code form never appeared";
+
+  let code = null;
+  while (!code && Date.now() < deadline) {
+    if (session.status !== "pending") return "";
+    code = mailboxCode(email, since);
+    if (!code) await sleep(2000);
+  }
+  if (!code) return "code sign-in: no verification code arrived in the mailbox";
+
+  await clickPoint(cdp, input);
+  await sleep(250);
+  await cdp.send("Input.insertText", { text: code });
+  await sleep(500);
+  const submit = await buttonPoint(cdp, "Continue");
+  if (!submit) return "code sign-in: no submit button";
+  await clickPoint(cdp, submit);
+
+  const agentOrigin = originOf(session.target);
+  for (let i = 0; i < 20; i++) {
+    await sleep(1000);
+    if (session.status !== "pending") return "";
+    let origin = "";
+    try {
+      origin = await evaluate(cdp, "location.origin");
+    } catch {
+      return "";
+    }
+    if (origin === agentOrigin) return "";
+  }
+  // The callback URL carries the oauth code; revisiting the agent site makes
+  // the SPA replay it so the token still lands.
+  try {
+    await cdp.send("Page.navigate", { url: session.target });
+  } catch {
+    return "code sign-in: could not return to the agent site";
+  }
+  return "";
+}
+
 /**
  * Drives the unified login form with the credentials the session carries.
  *
@@ -584,7 +742,12 @@ async function runAutoLogin(session) {
         /* the domains are not always available; the form still works */
       }
       try {
-        await session.cdp.send("Page.navigate", { url: `${accountOrigin}${LOGIN_PATH}` });
+        // The agent site is the entry point: its Sign in button hands the
+        // account site the login_redirect (oauth2 authorize + callback) that
+        // the token exchange needs; a bare unified-login visit never gets one.
+        await session.cdp.send("Page.navigate", { url: session.target });
+        await sleep(4000);
+        await evaluate(session.cdp, CLICK_SIGN_IN_EXPR);
       } catch {
         /* a dead socket is handled by the wait below */
       }
@@ -603,17 +766,35 @@ async function runAutoLogin(session) {
     }
     if (opened.origin === agentOrigin) return; // already signed in; poll loop owns it
 
+    // The login form is client-rendered; events sent before hydration land
+    // on nothing, so give the app a beat before touching it.
+    await sleep(1500);
+
     if (!opened.hasPassword) {
       if (!opened.hasIdentifier) return fail(`login page: ${opened.text}`);
       if (!(await evaluate(session.cdp, fillExpr(IDENTIFIER_SELECTOR, credentials.email)))) {
         return fail("login page has no identifier field");
       }
+      await evaluate(session.cdp, CLICK_TERMS_EXPR);
+      await sleep(300);
       if (!(await evaluate(session.cdp, CLICK_CONTINUE_EXPR))) {
         return fail("login page has no continue button");
       }
     }
 
     const passwordStep = await waitFor((state) => state.hasPassword, 20000);
+
+    // With a mailbox wired in, the emailed one-time code is the preferred way
+    // in: it works for accounts whose password was never set and it never
+    // burns a risk-control strike on a stale password.
+    if (MAILBOX_DB) {
+      const email = (credentials.email || "").trim();
+      const codeError = await emailCodeLogin(session, email);
+      delete session.credentials;
+      if (codeError) return fail(codeError);
+      return;
+    }
+
     if (!passwordStep) {
       const last = await readPage();
       // The page falls back to "create a password" (email code) for accounts
@@ -815,7 +996,9 @@ async function handleLogin(req, res) {
   // "socks5://127.0.0.1:1080". Passed through verbatim; when empty/absent no
   // --proxy-server flag is added and behaviour is unchanged.
   const proxy =
-    typeof parsed.proxy === "string" && parsed.proxy.trim() ? parsed.proxy : "";
+    (typeof parsed.proxy === "string" && parsed.proxy.trim() ? parsed.proxy : "") ||
+    (process.env.BRIDGE_LOGIN_PROXY || "").trim() ||
+    "";
 
   // Credentials turn the session into an automated sign-in. The password is
   // kept in memory only, never logged, and dropped as soon as it is typed.
@@ -867,7 +1050,7 @@ async function handleLogin(req, res) {
 
   // Automated sessions open the account site's login form; manual ones open the
   // agent site and wait for the operator to sign in there.
-  const openUrl = auto ? `${accountOriginFor(target)}${LOGIN_PATH}` : target;
+  const openUrl = target;
 
   const args = [
     `--remote-debugging-port=${debugPort}`,
