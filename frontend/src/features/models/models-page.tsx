@@ -3,11 +3,12 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tooltip } from "@/components/ui/tooltip";
-import { listModels, updateModel, type ModelDTO } from "@/features/models/models-api";
+import { listModels, syncMCodeModels, updateModel, type ModelDTO } from "@/features/models/models-api";
 import { errorMessage } from "@/shared/api/client";
 import { DataTableShell } from "@/shared/components/data-table-shell";
 import { EmptyState } from "@/shared/components/data-state";
@@ -134,11 +135,35 @@ export function ModelsPage() {
     onError: (error) => toast.error(errorMessage(error)),
   });
 
+  const syncMutation = useMutation({
+    mutationFn: syncMCodeModels,
+    onSuccess: (result) => {
+      toast.success(
+        t("models.syncMCodeDone", {
+          added: result.added,
+          updated: result.updated,
+          disabled: result.disabled,
+        }),
+      );
+      void queryClient.invalidateQueries({ queryKey: ["models"] });
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
   const items = modelsQuery.data?.items ?? [];
 
   return (
     <div className="space-y-5">
-      <PageHeader title={t("models.title")} description={t("models.description")} />
+      <PageHeader
+        title={t("models.title")}
+        description={t("models.description")}
+        actions={
+          <Button size="sm" variant="secondary" disabled={syncMutation.isPending} onClick={() => syncMutation.mutate()}>
+            {syncMutation.isPending ? <Spinner className="size-3.5" /> : null}
+            {t("models.syncMCode")}
+          </Button>
+        }
+      />
       <DataTableShell
         toolbar={<span className="text-xs text-muted-foreground">{t("common.total", { count: items.length })}</span>}
       >

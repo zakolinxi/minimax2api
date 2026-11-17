@@ -19,6 +19,12 @@ const (
 const (
 	KindToken = "token"
 	KindGuest = "guest"
+	// KindMCode is a MiniMax Code desktop account: the OAuth device-flow
+	// credential pair (mmoat_/mmort_) issued by account.minimax.io, not the
+	// web agent's JWT. It speaks the Anthropic Messages API on
+	// /mavis/api/v1/llm/v1/messages and never signs its requests, so it is a
+	// separate routing lane rather than another way to hold the same token.
+	KindMCode = "mcode"
 )
 
 // Model types.
@@ -31,6 +37,16 @@ const (
 	ModelTypeChat  = "chat"
 	ModelTypeImage = "image"
 	ModelTypeVideo = "video"
+)
+
+// Model upstream dispatch hints.
+//
+// Most values name a web-agent behaviour (`agent`, `chat`, `think`, `image`,
+// `video`). UpstreamMCode names the other protocol entirely: the model is served
+// by the MiniMax Code Messages API, which only a KindMCode account can reach. A
+// catalogue entry carrying it is therefore also a routing constraint.
+const (
+	UpstreamMCode = "mcode"
 )
 
 // Account regions. MiniMax operates two deployments with separate account
@@ -137,6 +153,14 @@ type Account struct {
 	Region string `json:"region"`
 	// Token is the JWT lifted from the agent site's localStorage.
 	Token string `json:"token"`
+	// RefreshToken and TokenExpiresAt belong to a MiniMax Code (KindMCode)
+	// account. The desktop client's access token is an opaque mmoat_ value that
+	// lives ~12h; without the mmort_ refresh pair the account would go dark
+	// after the first expiry and could only be repaired by hand.
+	//
+	// Both are stored exactly like Token: app.json is already secret material.
+	RefreshToken   string    `json:"refreshToken,omitempty"`
+	TokenExpiresAt time.Time `json:"tokenExpiresAt,omitempty"`
 	// UserID is the account's realUserID. The mainland deployment expects it
 	// alongside the token, and it doubles as a stable display identifier.
 	UserID string `json:"userId"`
@@ -254,7 +278,11 @@ type AccountView struct {
 	// disagree with the reading it came from.
 	Subscribed  bool   `json:"subscribed"`
 	TokenMasked string `json:"tokenMasked"`
-	Inflight    int    `json:"inflight"`
+	// HasRefreshToken and TokenExpiresAt describe a KindMCode account's
+	// renewable credential without exposing either token.
+	HasRefreshToken bool      `json:"hasRefreshToken,omitempty"`
+	TokenExpiresAt  time.Time `json:"tokenExpiresAt,omitempty"`
+	Inflight        int       `json:"inflight"`
 }
 
 // NewAccountView projects an account for API responses.
@@ -275,6 +303,7 @@ func NewAccountView(account *Account, inflight int) AccountView {
 		SuccessCount: account.SuccessCount, LastUsedAt: account.LastUsedAt,
 		LastError: account.LastError, CreatedAt: account.CreatedAt, UpdatedAt: account.UpdatedAt,
 		Quota: account.Quota, TokenMasked: MaskToken(account.Token), Inflight: inflight,
+		HasRefreshToken: account.RefreshToken != "", TokenExpiresAt: account.TokenExpiresAt,
 		SigninAt: account.SigninAt, SigninStatus: account.SigninStatus,
 		SigninStreak: account.SigninStreak, SigninPoints: account.SigninPoints,
 		SigninTotal: account.SigninTotal, SigninError: account.SigninError,
@@ -382,6 +411,12 @@ type ModelConfig struct {
 	// either the model offers one size or its options have not been read.
 	ContextLimit   int   `json:"contextLimit,omitempty"`
 	ContextWindows []int `json:"contextWindows,omitempty"`
+	// EffortOptions and DefaultEffort mirror `effort_options` and
+	// `default_effort` from the config endpoint. They describe the reasoning
+	// effort levels the model accepts, which travel as `thinking.effort` on the
+	// body's model object. Empty means the model exposes no effort control.
+	EffortOptions []string `json:"effortOptions,omitempty"`
+	DefaultEffort string   `json:"defaultEffort,omitempty"`
 	// ThinkingMode mirrors the upstream's `thinking_config.mode`: "forced_on",
 	// "switchable" or "forced_off". Empty means the model has no thinking
 	// control and the gateway sends no variant for it.
@@ -451,16 +486,43 @@ func BuiltinModels() []*ModelConfig {
 			// The upstream's own picker offers 512K and 1M, with 1M flagged
 			// "higher_usage". Thinking is forced on for this model, so there is
 			// no toggle to honour — a caller asking for it off still gets it on.
+			// The effort levels are the ones `/config` lists; the upstream calls
+			// "default" the default.
 			ContextLimit: 512000, ContextWindows: []int{512000, 1000000}, ThinkingMode: "forced_on",
-			Description: "最新旗舰 Flash，强制思考；上下文 512K，可切 1M（更费额度）",
+			EffortOptions: []string{"default", "low", "medium", "high", "xhigh", "max"},
+			DefaultEffort: "default",
+			Description:   "最新旗舰 Flash，强制思考；上下文 512K，可切 1M（更费额度）",
 		},
 		{
 			ID: "minimax-m3", Name: "MiniMax M3", Upstream: "chat", UpstreamModel: "MiniMax-M3", Type: ModelTypeChat,
 			Enabled: true, Builtin: true,
 			// Switchable, defaulting to on upstream; the gateway sends an
 			// explicit variant so `thinking:false` can actually turn it off.
-			ContextLimit: 450000, ThinkingMode: "switchable",
+			// 400000 is what `/config` reports, not the 450000 this entry used
+			// to guess.
+			ContextLimit: 400000, ThinkingMode: "switchable",
 			Description: "上一代旗舰，思考可开关（`thinking`）",
+		},
+		{
+			// The MiniMax Code lane. Same product, different protocol: an OAuth
+			// bearer instead of the web JWT, and the Anthropic Messages endpoint
+			// instead of the agent session API. The ids are deliberately distinct
+			// from the web entries above so a caller can choose the lane, and the
+			// pool routes on Upstream rather than on the id.
+			ID: "mcode-m3.1-flash", Name: "MiniMax Code M3.1 Flash", Upstream: UpstreamMCode,
+			UpstreamModel: "MiniMax-M3.1-Flash", Type: ModelTypeChat,
+			Enabled: true, Builtin: true,
+			ContextLimit: 512000, ContextWindows: []int{512000, 1000000}, ThinkingMode: "forced_on",
+			EffortOptions: []string{"default", "low", "medium", "high", "xhigh", "max"},
+			DefaultEffort: "default",
+			Description:   "MiniMax Code 订阅额度（Anthropic Messages），需要 mcode 账号",
+		},
+		{
+			ID: "mcode-m3", Name: "MiniMax Code M3", Upstream: UpstreamMCode,
+			UpstreamModel: "MiniMax-M3", Type: ModelTypeChat,
+			Enabled: true, Builtin: true,
+			ContextLimit: 512000, ThinkingMode: "switchable",
+			Description: "MiniMax Code 订阅额度，上一代旗舰，思考可开关",
 		},
 		{
 			ID: "minimax-image", Name: "MiniMax Image", Upstream: "image", Type: ModelTypeImage,
@@ -522,6 +584,21 @@ func videoDurations() []int {
 var legacyModelDescriptions = map[string]string{
 	"minimax-h3":     "视频生成，质量优先；消耗账号积分，不占用 Token Plan；支持多模态参考",
 	"minimax-h3-max": "视频生成，约 20 秒完成；仅支持文生视频与首/尾帧",
+}
+
+// legacyContextLimits are context sizes a previous release shipped that the
+// upstream reports differently.
+//
+// A correction is not the same thing as the backfills above: the stored value
+// is non-zero, so the "adopt only when empty" rule leaves it in place, and
+// every existing install would keep advertising a window the model does not
+// have. It is safe to overwrite because the console's model editor writes
+// `enabled`, `name` and `description` and nothing else — a non-default value
+// can only be a frozen guess from an earlier release, never an operator's
+// choice.
+var legacyContextLimits = map[string]struct{ legacy, current int }{
+	// 450000 was this gateway's own estimate; `/config` reports 400000.
+	"minimax-m3": {legacy: 450000, current: 400000},
 }
 
 // retiredBuiltinModels are catalogue ids the upstream no longer offers.
@@ -648,6 +725,22 @@ func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
 		}
 		if model.ThinkingMode == "" && builtin.ThinkingMode != "" {
 			model.ThinkingMode = builtin.ThinkingMode
+			changed = true
+		}
+		// The effort levels are another fact the console cannot write, so a
+		// stored entry without them is a freeze from before the field existed.
+		if len(model.EffortOptions) == 0 && len(builtin.EffortOptions) > 0 {
+			model.EffortOptions = builtin.EffortOptions
+			changed = true
+		}
+		if model.DefaultEffort == "" && builtin.DefaultEffort != "" {
+			model.DefaultEffort = builtin.DefaultEffort
+			changed = true
+		}
+		// Unlike the fields above, this one corrects a value rather than
+		// filling a blank. See legacyContextLimits.
+		if legacy, ok := legacyContextLimits[model.ID]; ok && model.ContextLimit == legacy.legacy {
+			model.ContextLimit = legacy.current
 			changed = true
 		}
 		// A plan requirement is a fact about the upstream rather than policy

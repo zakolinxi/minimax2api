@@ -74,6 +74,13 @@ import {
   probeAllAccounts,
   refreshAllQuota,
   refreshCredit,
+  importLocalMCode,
+  importMCodeToken,
+  fetchMCodeCatalog,
+  mcodeDeviceCancel,
+  mcodeDevicePoll,
+  mcodeDeviceStart,
+  refreshMCodeAccount,
   refreshQuota,
   reloginAccount,
   runSignin,
@@ -84,6 +91,9 @@ import {
   type AccountRegion,
   type AccountRegionInput,
   type AccountSummary,
+  type MCodeCatalogModel,
+  type MCodeDeviceView,
+  type MCodeLocalResult,
 } from "@/features/accounts/accounts-api";
 import { AccountNameCell, AccountPlanCell, AccountRoutingCell, AccountStatusCell } from "@/features/accounts/account-name-cell";
 import { AccountQuotaCell } from "@/features/accounts/account-quota";
@@ -219,6 +229,27 @@ export function AccountsPage() {
   const browserTimerRef = useRef<number | null>(null);
   const browserPollInFlightRef = useRef(false);
   const browserMountedRef = useRef(true);
+
+  // MiniMax Code sign-in. It is a separate dialog because the credential is a
+  // different species: an OAuth pair, not a web JWT, and the account it creates
+  // lives in another routing lane.
+  const [mcodeOpen, setMcodeOpen] = useState(false);
+  const [mcodeTab, setMcodeTab] = useState<"device" | "token">("device");
+  const [mcodeRegion, setMcodeRegion] = useState<AccountRegion>("global");
+  const [mcodeBusy, setMcodeBusy] = useState(false);
+  const [mcodeFlow, setMcodeFlow] = useState<MCodeDeviceView | null>(null);
+  const [mcodeAccessToken, setMcodeAccessToken] = useState("");
+  const [mcodeRefreshToken, setMcodeRefreshToken] = useState("");
+  const [mcodeRotate, setMcodeRotate] = useState(false);
+  const [mcodeLocalPath, setMcodeLocalPath] = useState("");
+  const [mcodeLocalBusy, setMcodeLocalBusy] = useState(false);
+  const [mcodeLocalResults, setMcodeLocalResults] = useState<MCodeLocalResult[] | null>(null);
+  const [mcodeCatalogBusy, setMcodeCatalogBusy] = useState(false);
+  const [mcodeCatalog, setMcodeCatalog] = useState<MCodeCatalogModel[] | null>(null);
+  const mcodeFlowRef = useRef<string | null>(null);
+  const mcodeTimerRef = useRef<number | null>(null);
+  const mcodePollInFlightRef = useRef(false);
+  const mcodeMountedRef = useRef(true);
 
   const accountsQuery = useQuery({
     queryKey: ["accounts", page, pageSize, search, statusFilter, kindFilter, groupFilter, subscriptionFilter],
@@ -526,6 +557,17 @@ export function AccountsPage() {
     onError: (error) => toast.error(errorMessage(error)),
   });
 
+  // MiniMax Code accounts renew through their own endpoint: there is no browser
+  // and no password, only the refresh pair.
+  const mcodeRefreshMutation = useMutation({
+    mutationFn: (id: string) => refreshMCodeAccount(id),
+    onSuccess: () => {
+      toast.success(t("accounts.mcodeRefreshed"));
+      invalidate();
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
   const busy =
     batchMutation.isPending ||
     probeAllMutation.isPending ||
@@ -557,6 +599,7 @@ export function AccountsPage() {
       { value: "", label: t("accounts.allTypes") },
       { value: "token", label: "Token" },
       { value: "guest", label: t("accounts.providerMiniMax") + t("accounts.guestSuffix") },
+      { value: "mcode", label: t("accounts.kindMCode") },
     ],
     [t],
   );
@@ -784,6 +827,207 @@ export function AccountsPage() {
     };
   }, []);
 
+  // -------------------------------------------------------- MiniMax Code sign-in
+  //
+  // Device authorization is the desktop client's own flow: the console shows a
+  // user code, the operator approves it in a browser, and the backend turns the
+  // poll result into an account. The two import paths next to it exist for
+  // machines that already have a pair.
+
+  function stopMcodeTimer(): void {
+    if (mcodeTimerRef.current !== null) {
+      window.clearInterval(mcodeTimerRef.current);
+      mcodeTimerRef.current = null;
+    }
+    mcodePollInFlightRef.current = false;
+  }
+
+  function clearMcodeFlow(cancelSession: boolean): void {
+    stopMcodeTimer();
+    const flowId = mcodeFlowRef.current;
+    mcodeFlowRef.current = null;
+    setMcodeBusy(false);
+    if (cancelSession && flowId) {
+      void mcodeDeviceCancel(flowId).catch(() => {
+        // The flow may already have reached a verdict; cancelling is best effort.
+      });
+    }
+  }
+
+  function handleMcodeOpenChange(open: boolean): void {
+    if (open) {
+      setMcodeOpen(true);
+      return;
+    }
+    clearMcodeFlow(true);
+    setMcodeOpen(false);
+    setMcodeFlow(null);
+    setMcodeTab("device");
+    setMcodeRegion("global");
+    setMcodeAccessToken("");
+    setMcodeRefreshToken("");
+    setMcodeRotate(false);
+    setMcodeLocalPath("");
+    setMcodeLocalResults(null);
+  }
+
+  function finishMcodeSuccess(): void {
+    clearMcodeFlow(false);
+    setMcodeFlow(null);
+    setMcodeOpen(false);
+    setMcodeTab("device");
+    setMcodeRegion("global");
+    setMcodeAccessToken("");
+    setMcodeRefreshToken("");
+    setMcodeRotate(false);
+    setMcodeLocalResults(null);
+    toast.success(t("accounts.mcodeSuccess"));
+    invalidate();
+  }
+
+  function finishMcodeFailure(message: string): void {
+    clearMcodeFlow(false);
+    setMcodeFlow(null);
+    toast.error(message);
+  }
+
+  function mcodeFailureText(view: MCodeDeviceView): string {
+    if (view.error) return view.error;
+    switch (view.status) {
+      case "denied":
+        return t("accounts.mcodeDenied");
+      case "expired":
+        return t("accounts.mcodeExpired");
+      case "cancelled":
+        return t("accounts.mcodeCancelled");
+      default:
+        return t("accounts.mcodeFailed");
+    }
+  }
+
+  function startMcodePolling(flowId: string): void {
+    stopMcodeTimer();
+    mcodeTimerRef.current = window.setInterval(() => {
+      if (mcodePollInFlightRef.current) return;
+      mcodePollInFlightRef.current = true;
+      void mcodeDevicePoll(flowId)
+        .then((view) => {
+          if (!mcodeMountedRef.current || mcodeFlowRef.current !== flowId) return;
+          setMcodeFlow(view);
+          if (view.status === "pending") return;
+          if (view.status === "authorized") {
+            finishMcodeSuccess();
+            return;
+          }
+          finishMcodeFailure(mcodeFailureText(view));
+        })
+        .catch((error: unknown) => {
+          if (!mcodeMountedRef.current || mcodeFlowRef.current !== flowId) return;
+          finishMcodeFailure(errorMessage(error));
+        })
+        .finally(() => {
+          mcodePollInFlightRef.current = false;
+        });
+    }, 2000);
+  }
+
+  async function startMcodeDevice(): Promise<void> {
+    setMcodeBusy(true);
+    setMcodeFlow(null);
+    try {
+      const view = await mcodeDeviceStart(mcodeRegion);
+      if (!mcodeMountedRef.current) {
+        void mcodeDeviceCancel(view.id).catch(() => undefined);
+        return;
+      }
+      mcodeFlowRef.current = view.id;
+      setMcodeFlow(view);
+      setMcodeBusy(false);
+      startMcodePolling(view.id);
+    } catch (error) {
+      if (!mcodeMountedRef.current) return;
+      setMcodeBusy(false);
+      toast.error(errorMessage(error));
+    }
+  }
+
+  async function submitMcodeToken(): Promise<void> {
+    if (!mcodeAccessToken.trim() && !mcodeRefreshToken.trim()) {
+      toast.error(t("accounts.mcodeTokenRequired"));
+      return;
+    }
+    setMcodeBusy(true);
+    try {
+      await importMCodeToken({
+        accessToken: mcodeAccessToken.trim() || undefined,
+        refreshToken: mcodeRefreshToken.trim() || undefined,
+        region: mcodeRegion,
+        refresh: mcodeRotate && Boolean(mcodeRefreshToken.trim()),
+      });
+      finishMcodeSuccess();
+    } catch (error) {
+      toast.error(errorMessage(error));
+    } finally {
+      setMcodeBusy(false);
+    }
+  }
+
+  async function runMcodeLocalImport(): Promise<void> {
+    setMcodeLocalBusy(true);
+    setMcodeLocalResults(null);
+    try {
+      const result = await importLocalMCode({
+        path: mcodeLocalPath.trim() || undefined,
+        refresh: mcodeRotate,
+      });
+      setMcodeLocalResults(result.results);
+      const added = result.results.filter((item) => item.status === "added").length;
+      if (added > 0) {
+        invalidate();
+        toast.success(t("accounts.mcodeLocalAdded", { count: added }));
+      } else {
+        toast.error(t("accounts.mcodeLocalNone"));
+      }
+    } catch (error) {
+      toast.error(errorMessage(error));
+    } finally {
+      setMcodeLocalBusy(false);
+    }
+  }
+
+  async function loadMcodeCatalog(): Promise<void> {
+    setMcodeCatalogBusy(true);
+    try {
+      const result = await fetchMCodeCatalog();
+      setMcodeCatalog(result.models);
+      if (result.models.length === 0) {
+        toast.error(t("accounts.mcodeCatalogEmpty"));
+      }
+    } catch (error) {
+      toast.error(errorMessage(error));
+    } finally {
+      setMcodeCatalogBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    mcodeMountedRef.current = true;
+    return () => {
+      mcodeMountedRef.current = false;
+      if (mcodeTimerRef.current !== null) {
+        window.clearInterval(mcodeTimerRef.current);
+        mcodeTimerRef.current = null;
+      }
+      const flowId = mcodeFlowRef.current;
+      mcodeFlowRef.current = null;
+      if (flowId) {
+        void mcodeDeviceCancel(flowId).catch(() => {
+          // Best effort on teardown.
+        });
+      }
+    };
+  }, []);
+
   return (
     <div className="space-y-5">
       <PageHeader
@@ -807,6 +1051,10 @@ export function AccountsPage() {
                 <DropdownMenuItem onClick={openBrowserDialog}>
                   <Globe />
                   {t("accounts.browserLogin")}
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setMcodeOpen(true)}>
+                  <KeyRound />
+                  {t("accounts.mcodeLogin")}
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => setImportOpen(true)}>
                   <FileUp />
@@ -1058,6 +1306,7 @@ export function AccountsPage() {
               onSignin={(id) => signinOneMutation.mutate(id)}
               onCredit={(id) => creditMutation.mutate(id)}
               onRelogin={(id) => reloginMutation.mutate(id)}
+              onMCodeRefresh={(id) => mcodeRefreshMutation.mutate(id)}
               onClearCooldown={(id) => batchMutation.mutate({ action: "clearCooldown", ids: [id] })}
               onToggleEnabled={(account) => toggleEnabledMutation.mutate(account)}
               onDelete={setDeleteTarget}
@@ -1356,6 +1605,190 @@ export function AccountsPage() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={mcodeOpen} onOpenChange={handleMcodeOpenChange}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>{t("accounts.mcodeTitle")}</DialogTitle>
+            <DialogDescription>{t("accounts.mcodeDescription")}</DialogDescription>
+          </DialogHeader>
+
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              variant={mcodeTab === "device" ? "default" : "secondary"}
+              disabled={mcodeBusy}
+              onClick={() => setMcodeTab("device")}
+            >
+              {t("accounts.mcodeTabDevice")}
+            </Button>
+            <Button
+              size="sm"
+              variant={mcodeTab === "token" ? "default" : "secondary"}
+              disabled={mcodeBusy}
+              onClick={() => setMcodeTab("token")}
+            >
+              {t("accounts.mcodeTabToken")}
+            </Button>
+          </div>
+
+          <div className="space-y-2">
+            <Label>{t("accounts.region")}</Label>
+            <Select
+              ariaLabel={t("accounts.region")}
+              disabled={mcodeBusy}
+              value={mcodeRegion}
+              onChange={(value) => setMcodeRegion(value as AccountRegion)}
+              options={browserRegionOptions}
+            />
+            <p className="text-[11px] leading-5 text-muted-foreground">{t("accounts.mcodeRegionHelp")}</p>
+          </div>
+
+          <div className="space-y-2 rounded-md border border-border/60 p-3">
+            <div className="flex items-center justify-between gap-2">
+              <Label>{t("accounts.mcodeCatalogTitle")}</Label>
+              <Button size="sm" variant="secondary" disabled={mcodeCatalogBusy} onClick={() => void loadMcodeCatalog()}>
+                {t("accounts.mcodeCatalogAction")}
+              </Button>
+            </div>
+            <p className="text-[11px] leading-5 text-muted-foreground">{t("accounts.mcodeCatalogHelp")}</p>
+            {mcodeCatalog ? (
+              <ul className="space-y-1 text-[11px]">
+                {mcodeCatalog.map((item) => (
+                  <li key={item.id} className="flex items-center justify-between gap-2">
+                    <span className="truncate font-mono">{item.id}</span>
+                    <span className="shrink-0 text-muted-foreground">
+                      {item.name}
+                      {item.contextLimit ? ` · ${formatNumber(item.contextLimit)}` : ""}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+
+          {mcodeTab === "device" ? (
+            <div className="space-y-3">
+              {mcodeFlow && (mcodeFlow.status === "pending" || !mcodeFlow.status) ? (
+                <div className="space-y-2 rounded-md border border-border/60 bg-secondary/30 p-3">
+                  <p className="text-xs text-muted-foreground">{t("accounts.mcodeUserCode")}</p>
+                  <p className="font-mono text-2xl tracking-[0.2em]">{mcodeFlow.userCode}</p>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => {
+                        void navigator.clipboard?.writeText(mcodeFlow.userCode ?? "").then(
+                          () => toast.success(t("accounts.mcodeCopied")),
+                          () => toast.error(t("accounts.mcodeCopyFailed")),
+                        );
+                      }}
+                    >
+                      {t("accounts.mcodeCopyCode")}
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        const url = mcodeFlow.verificationUriComplete || mcodeFlow.verificationUri;
+                        if (url) window.open(url, "_blank", "noopener,noreferrer");
+                      }}
+                    >
+                      <Globe />
+                      {t("accounts.mcodeOpenPage")}
+                    </Button>
+                  </div>
+                  <p className="flex items-center gap-2 text-[11px] text-muted-foreground" aria-live="polite">
+                    <Spinner className="size-3" />
+                    {t("accounts.mcodeWaiting")}
+                  </p>
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">{t("accounts.mcodeDeviceHelp")}</p>
+              )}
+              <Button size="sm" disabled={mcodeBusy} onClick={() => void startMcodeDevice()}>
+                {mcodeFlow ? t("accounts.mcodeRestart") : t("accounts.mcodeStart")}
+              </Button>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="space-y-2">
+                <Label htmlFor="mcode-access-token">{t("accounts.mcodeAccessToken")}</Label>
+                <Textarea
+                  id="mcode-access-token"
+                  className="min-h-16 font-mono text-[11px]"
+                  disabled={mcodeBusy}
+                  value={mcodeAccessToken}
+                  onChange={(event) => setMcodeAccessToken(event.target.value)}
+                  placeholder="mmoat_..."
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="mcode-refresh-token">{t("accounts.mcodeRefreshToken")}</Label>
+                <Textarea
+                  id="mcode-refresh-token"
+                  className="min-h-16 font-mono text-[11px]"
+                  disabled={mcodeBusy}
+                  value={mcodeRefreshToken}
+                  onChange={(event) => setMcodeRefreshToken(event.target.value)}
+                  placeholder="mmort_..."
+                />
+              </div>
+              <label className="flex items-start gap-2 text-[11px] leading-5 text-muted-foreground">
+                <Checkbox
+                  checked={mcodeRotate}
+                  disabled={mcodeBusy}
+                  onCheckedChange={(checked) => setMcodeRotate(checked === true)}
+                />
+                <span>{t("accounts.mcodeRotateHelp")}</span>
+              </label>
+              <Button size="sm" disabled={mcodeBusy} onClick={() => void submitMcodeToken()}>
+                {t("accounts.mcodeImport")}
+              </Button>
+            </div>
+          )}
+
+          <div className="space-y-2 rounded-md border border-border/60 p-3">
+            <Label htmlFor="mcode-local-path">{t("accounts.mcodeLocalTitle")}</Label>
+            <Input
+              id="mcode-local-path"
+              className="font-mono text-[11px]"
+              disabled={mcodeLocalBusy}
+              value={mcodeLocalPath}
+              onChange={(event) => setMcodeLocalPath(event.target.value)}
+              placeholder={t("accounts.mcodeLocalPlaceholder")}
+            />
+            <p className="text-[11px] leading-5 text-muted-foreground">{t("accounts.mcodeLocalHelp")}</p>
+            <Button size="sm" variant="secondary" disabled={mcodeLocalBusy} onClick={() => void runMcodeLocalImport()}>
+              {t("accounts.mcodeLocalAction")}
+            </Button>
+            {mcodeLocalResults ? (
+              <ul className="space-y-1 text-[11px]">
+                {mcodeLocalResults.map((item) => (
+                  <li key={item.path} className="flex items-center justify-between gap-2">
+                    <span className="truncate font-mono text-muted-foreground">{item.path}</span>
+                    <span
+                      className={cn(
+                        "shrink-0",
+                        item.status === "added" && "text-quota-product-1",
+                        item.status === "failed" && "text-destructive",
+                      )}
+                    >
+                      {item.status}
+                      {item.error ? `: ${item.error}` : ""}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+
+          <DialogFooter>
+            <Button variant="secondary" size="sm" onClick={() => handleMcodeOpenChange(false)}>
+              {t("common.close")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={browserOpen} onOpenChange={handleBrowserOpenChange}>
         <DialogContent className="max-w-lg">
           <DialogHeader>
@@ -1609,6 +2042,7 @@ function AccountsTable({
   onSignin,
   onCredit,
   onRelogin,
+  onMCodeRefresh,
   onClearCooldown,
   onToggleEnabled,
   onDelete,
@@ -1626,6 +2060,7 @@ function AccountsTable({
   onSignin: (id: string) => void;
   onCredit: (id: string) => void;
   onRelogin: (id: string) => void;
+  onMCodeRefresh: (id: string) => void;
   onClearCooldown: (id: string) => void;
   onToggleEnabled: (account: AccountDTO) => void;
   onDelete: (account: AccountDTO) => void;
@@ -1730,10 +2165,17 @@ function AccountsTable({
                     <Coins />
                     {t("accounts.refreshCredit")}
                   </DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => onRelogin(account.id)}>
-                    <KeyRound />
-                    {t("accounts.reloginNow")}
-                  </DropdownMenuItem>
+                  {account.kind === "mcode" ? (
+                    <DropdownMenuItem onClick={() => onMCodeRefresh(account.id)}>
+                      <RefreshCw />
+                      {t("accounts.mcodeRefreshNow")}
+                    </DropdownMenuItem>
+                  ) : (
+                    <DropdownMenuItem onClick={() => onRelogin(account.id)}>
+                      <KeyRound />
+                      {t("accounts.reloginNow")}
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuItem onClick={() => onQuota(account.id)}>
                     <RefreshCw />
                     {t("accounts.refreshQuota")}

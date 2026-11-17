@@ -42,6 +42,13 @@ type API struct {
 	// the login endpoint can lock out brute force. Guarded by loginMu.
 	loginMu       sync.Mutex
 	loginFailures map[string]*loginAttempt
+
+	// mcodeFlows holds in-flight MiniMax Code device authorizations. They are
+	// process-local on purpose: a device code is short-lived and tied to the
+	// verifier that created it, so persisting one across a restart would hand
+	// out a flow nobody can complete.
+	mcodeMu    sync.Mutex
+	mcodeFlows map[string]*mcodeDeviceFlow
 }
 
 func New(st *store.Store, p *pool.Pool, client *minimax.Client, signinSvc *signin.Service, settings func() config.Settings, browserLoginBridge string) *API {
@@ -51,6 +58,7 @@ func New(st *store.Store, p *pool.Pool, client *minimax.Client, signinSvc *signi
 		httpClient:         &http.Client{},
 		started:            time.Now(),
 		loginFailures:      make(map[string]*loginAttempt),
+		mcodeFlows:         make(map[string]*mcodeDeviceFlow),
 	}
 }
 
@@ -71,6 +79,14 @@ func (a *API) Register(mux *http.ServeMux) {
 
 	route("GET", "/admin/api/accounts", a.guard(a.listAccounts))
 	route("POST", "/admin/api/accounts", a.guard(a.createAccount))
+	route("POST", "/admin/api/accounts/mcode/device", a.guard(a.startMCodeDevice))
+	route("GET", "/admin/api/accounts/mcode/catalog", a.guard(a.mcodeCatalog))
+	route("GET", "/admin/api/accounts/mcode/device/{id}", a.guard(a.getMCodeDevice))
+	route("DELETE", "/admin/api/accounts/mcode/device/{id}", a.guard(a.cancelMCodeDevice))
+	route("POST", "/admin/api/accounts/mcode/token", a.guard(a.importMCodeToken))
+	route("POST", "/admin/api/accounts/mcode/import-local", a.guard(a.importLocalMCode))
+	route("POST", "/admin/api/accounts/{id}/mcode-refresh", a.guard(a.refreshMCodeAccount))
+
 	route("GET", "/admin/api/accounts/groups", a.guard(a.accountGroups))
 	route("GET", "/admin/api/accounts/export", a.guard(a.exportAccounts))
 	route("POST", "/admin/api/accounts/import", a.guard(a.importAccounts))
@@ -95,6 +111,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	route("DELETE", "/admin/api/client-keys/{id}", a.guard(a.deleteClientKey))
 
 	route("GET", "/admin/api/models", a.guard(a.listModels))
+	route("POST", "/admin/api/models/mcode-sync", a.guard(a.syncMCodeModels))
 	route("PATCH", "/admin/api/models/{id}", a.guard(a.updateModel))
 
 	route("GET", "/admin/api/audits", a.guard(a.listAudits))

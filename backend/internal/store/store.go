@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -933,6 +934,25 @@ func (s *Store) UpdateModel(id string, apply func(*ModelConfig)) (*ModelConfig, 
 		return model.clone(), nil
 	}
 	return nil, ErrNotFound
+}
+
+// AddModel appends a catalogue entry. The id is the caller's: a synced entry
+// derives it from the upstream model id, and a duplicate is refused rather than
+// silently shadowing the existing one.
+func (s *Store) AddModel(model *ModelConfig) error {
+	if model == nil || strings.TrimSpace(model.ID) == "" {
+		return errors.New("model id is required")
+	}
+	s.mu.Lock()
+	defer s.unlockAndNotify()
+	for _, existing := range s.state.Models {
+		if existing.ID == model.ID {
+			return ErrAlreadyExists
+		}
+	}
+	s.state.Models = append(s.state.Models, model.clone())
+	s.markDirtyLocked()
+	return nil
 }
 
 // RecordModelUsage accumulates per-model counters. Like BumpClientKeyUsage it

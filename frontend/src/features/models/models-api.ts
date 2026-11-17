@@ -50,6 +50,23 @@ export function listModels(): Promise<{ items: ModelDTO[] }> {
   return apiRequest("/admin/api/models");
 }
 
+/**
+ * Re-reads the MiniMax Code catalog and diffs it into the local catalogue.
+ * Matching is by upstream model id, so ids, names, counters and the operator's
+ * enable/disable choices survive; a model the upstream dropped is disabled, not
+ * deleted.
+ */
+export function syncMCodeModels(): Promise<{
+  accountId: string;
+  region: string;
+  catalog: number;
+  added: number;
+  updated: number;
+  disabled: number;
+}> {
+  return apiRequest("/admin/api/models/mcode-sync", { method: "POST" });
+}
+
 export function updateModel(id: string, payload: Partial<{ enabled: boolean; name: string; description: string }>): Promise<{ model: ModelDTO }> {
   return apiRequest(`/admin/api/models/${id}`, { method: "PATCH", body: payload });
 }

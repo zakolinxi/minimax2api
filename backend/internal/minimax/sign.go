@@ -35,14 +35,51 @@ func XSignature(timestamp time.Time, body string) string {
 
 // YY reproduces the upstream `yy` header:
 //
-//	MD5( encodeURIComponent(full_url) + "_" + body + MD5(str(ms)) + "ooui" )
+//	MD5( encodeURIComponent(path_with_query) + "_" + body + MD5(str(ms)) + "ooui" )
 //
-// Unlike x-signature this one binds the full request URL (including the client
-// metadata query string) and a millisecond timestamp, so it must be computed
-// against the same URL that is actually requested.
-func YY(fullURL string, body string, timestamp time.Time) string {
-	millis := strconv.FormatInt(timestamp.UnixMilli(), 10)
-	return md5Hex(encodeURIComponent(fullURL) + "_" + body + md5Hex(millis) + signatureSuffix)
+// Two details of that formula are easy to get wrong, and both are silent when
+// they are:
+//
+//   - The signed target is the *path and query* the axios call names, never the
+//     absolute URL. The bundle keeps `baseURL` separate and signs `e.url`
+//     (module 52724, fed by the interceptor in module 2503), so anything the
+//     host contributes is not covered. This is the opposite of what the header
+//     name suggests.
+//   - `ms` is `Date.parse(new Date().toString())`: milliseconds, but rounded
+//     down to the whole second. The same reading becomes `x-timestamp` after
+//     another division by 1000, which is why the two headers always agree.
+//
+// The body half is not simply the request body either; see yyBody.
+func YY(signedTarget string, body string, timestamp time.Time) string {
+	millis := strconv.FormatInt(signatureMillis(timestamp), 10)
+	return md5Hex(encodeURIComponent(signedTarget) + "_" + body + md5Hex(millis) + signatureSuffix)
+}
+
+// signatureMillis is the timestamp the web client actually signs.
+//
+// `Date.parse(new Date().toString())` drops the sub-second part: toString has
+// whole-second resolution, so the milliseconds always end in 000. Reproducing
+// that here keeps `unix` in the query and the digest below describing the same
+// instant — a clock value with real milliseconds would sign a time the browser
+// never sends.
+func signatureMillis(timestamp time.Time) int64 {
+	return timestamp.Truncate(time.Second).UnixMilli()
+}
+
+// yyBody reports the string the bundle feeds into the yy digest (module 52724):
+//
+//	o = "{}"
+//	if method is POST { o = body ? JSON.stringify(body) : "{}" }
+//
+// So a GET signs "{}" no matter what, and a bodyless POST signs "{}" too. Only
+// a POST with a body signs the serialised body. x-signature uses a different
+// input — the raw request bytes, empty for a GET — which is why the two digests
+// cannot share a helper.
+func yyBody(method string, body []byte) string {
+	if !strings.EqualFold(method, "post") || len(body) == 0 {
+		return "{}"
+	}
+	return string(body)
 }
 
 // encodeURIComponent mirrors the JavaScript built-in of the same name.

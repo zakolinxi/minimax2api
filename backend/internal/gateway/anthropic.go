@@ -154,6 +154,7 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		ContextLimit: contextLimit,
 		SessionKey:   "",
 		Started:      started,
+		MaxTokens:    request.MaxTokens,
 		OnDelta:      onDelta,
 		OnThinking:   onThinking,
 		Committed:    func() bool { return out.wroteHeader },

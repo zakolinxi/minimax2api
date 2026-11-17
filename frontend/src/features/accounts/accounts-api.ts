@@ -1,7 +1,12 @@
 import { apiRequest } from "@/shared/api/client";
 
 export type AccountStatus = "active" | "cooldown" | "disabled" | "invalid";
-export type AccountKind = "token" | "guest";
+/**
+ * "mcode" is the MiniMax Code desktop lane: an OAuth bearer pair instead of the
+ * web JWT, routed to the Anthropic Messages endpoint. The two kinds never share
+ * an account.
+ */
+export type AccountKind = "token" | "guest" | "mcode";
 
 /**
  * Region picks which MiniMax deployment the account belongs to. The two run
@@ -124,6 +129,13 @@ export type AccountDTO = {
    * console never claims an account is eligible when routing disagrees.
    */
   subscribed: boolean;
+  /**
+   * MiniMax Code accounts only: whether a refresh token is stored (never the
+   * token itself) and when the access token expires. The gateway renews it ten
+   * minutes before that instant.
+   */
+  hasRefreshToken?: boolean;
+  tokenExpiresAt?: string;
 };
 
 export type AccountSummary = {
@@ -377,4 +389,95 @@ export function browserLoginPoll(sessionId: string): Promise<BrowserLoginResult>
 
 export function browserLoginCancel(sessionId: string): Promise<{ cancelled: boolean }> {
   return apiRequest(`/admin/api/browser-login/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+}
+
+// ------------------------------------------------------------- MiniMax Code
+//
+// A second account lane: the desktop product's OAuth pair instead of the web
+// JWT. Three ways in — device authorization, a pasted pair, or the credential
+// files a local installation already has.
+
+/** One device authorization. Secrets (device code, verifier) never leave the server. */
+export type MCodeDeviceView = {
+  id: string;
+  region: AccountRegion;
+  status: "pending" | "authorized" | "denied" | "expired" | "failed" | "cancelled";
+  error?: string;
+  userCode?: string;
+  verificationUri?: string;
+  verificationUriComplete?: string;
+  expiresIn?: number;
+  interval?: number;
+  /** Present once the authorization succeeded and the account was written. */
+  account?: AccountDTO;
+};
+
+export function mcodeDeviceStart(region: AccountRegion): Promise<MCodeDeviceView> {
+  return apiRequest("/admin/api/accounts/mcode/device", { method: "POST", body: { region } });
+}
+
+export function mcodeDevicePoll(id: string): Promise<MCodeDeviceView> {
+  return apiRequest(`/admin/api/accounts/mcode/device/${encodeURIComponent(id)}`);
+}
+
+export function mcodeDeviceCancel(id: string): Promise<{ status: string }> {
+  return apiRequest(`/admin/api/accounts/mcode/device/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+/**
+ * Validates a pasted pair and adds it. `refresh` is opt-in because a successful
+ * refresh rotates the pair and signs the desktop app that owns it out.
+ */
+export function importMCodeToken(payload: {
+  accessToken?: string;
+  refreshToken?: string;
+  region?: AccountRegion;
+  name?: string;
+  remark?: string;
+  refresh?: boolean;
+}): Promise<AccountDTO> {
+  return apiRequest("/admin/api/accounts/mcode/token", { method: "POST", body: payload });
+}
+
+export type MCodeLocalResult = {
+  path: string;
+  status: "added" | "skipped" | "failed";
+  accountId?: string;
+  error?: string;
+};
+
+/** Reads an installation's auth directory. Blank path means ~/.minimax/auth. */
+export function importLocalMCode(payload: { path?: string; refresh?: boolean }): Promise<{
+  root: string;
+  results: MCodeLocalResult[];
+}> {
+  return apiRequest("/admin/api/accounts/mcode/import-local", { method: "POST", body: payload });
+}
+
+/** Renews one account now, rather than waiting for the gateway's own sweep. */
+export function refreshMCodeAccount(id: string): Promise<AccountDTO> {
+  return apiRequest(`/admin/api/accounts/${id}/mcode-refresh`, { method: "POST" });
+}
+
+/** One entry of the upstream catalog, as `/mavis/api/v1/models` reports it. */
+export type MCodeCatalogModel = {
+  id: string;
+  name: string;
+  reasoning?: boolean;
+  attachment?: boolean;
+  toolCall?: boolean;
+  contextLimit?: number;
+  maxOutput?: number;
+  input?: string[];
+  thinking?: string;
+  contextWindows?: number[];
+};
+
+/** Reads the live catalog with an existing account's token. */
+export function fetchMCodeCatalog(): Promise<{
+  accountId: string;
+  region: AccountRegion;
+  models: MCodeCatalogModel[];
+}> {
+  return apiRequest("/admin/api/accounts/mcode/catalog");
 }

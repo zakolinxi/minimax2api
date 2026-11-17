@@ -456,6 +456,48 @@ func TestChatCompletionsSendsTheModelSelection(t *testing.T) {
 	}
 }
 
+// OpenAI's `reasoning_effort` and the upstream's `thinking.effort` are the same
+// knob. The catalogue advertises the accepted levels, so the value is repaired
+// into one of them rather than forwarded blind — an unlisted level would come
+// back as a 400 naming nothing the caller recognises.
+func TestChatCompletionsMapsReasoningEffort(t *testing.T) {
+	cases := []struct {
+		name    string
+		request string
+		want    string
+	}{
+		{"advertised level", "high", "high"},
+		{"case repaired to the catalogue spelling", "HIGH", "high"},
+		{"unlisted level falls back to the default", "extreme", "default"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var captured map[string]any
+			h := newHarness(t, captureUpstream(t, &captured))
+			h.addAccount(t, "primary", "token-good", 10)
+
+			rec := h.chat(t, map[string]any{
+				"model":            "minimax-m3.1-flash",
+				"reasoning_effort": tc.request,
+				"messages":         []any{map[string]any{"role": "user", "content": "hi"}},
+			}, h.key)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			selection, _ := captured["model"].(map[string]any)
+			thinking, _ := selection["thinking"].(map[string]any)
+			if thinking["effort"] != tc.want {
+				t.Fatalf("thinking = %v, want effort %q", selection["thinking"], tc.want)
+			}
+			// No evidence has ever shown `reasoning` being sent, and /config
+			// does not advertise it; a fabricated value is not worth a 400.
+			if _, sent := selection["reasoning"]; sent {
+				t.Errorf("reasoning was sent without being asked for: %v", selection["reasoning"])
+			}
+		})
+	}
+}
+
 // A switchable model needs an explicit empty variant to turn thinking off; the
 // upstream default is on, so omitting the field would be the opposite of what
 // the caller asked for.

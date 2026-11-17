@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -260,6 +261,13 @@ func routable(account *store.Account, inflight int, now time.Time, settings conf
 	}
 	if account.Status == store.StatusCooldown && now.Before(account.CooldownUntil) {
 		return false
+	}
+	// The MiniMax Code lane signs nothing: it has no fingerprint, no realUserID
+	// and no agent, so those prerequisites would make every mcode account
+	// permanently unroutable. Its only requirement is a credential — a bearer,
+	// or the refresh pair that can mint one.
+	if account.Kind == store.KindMCode {
+		return strings.TrimSpace(account.Token) != "" || strings.TrimSpace(account.RefreshToken) != ""
 	}
 	// A token without a fingerprint cannot be replayed: the yy signature is
 	// computed over the fingerprint query string, so an account missing either

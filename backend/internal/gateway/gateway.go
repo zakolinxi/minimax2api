@@ -96,10 +96,20 @@ type chatRequest struct {
 	// nearest size the model offers rather than rejected; zero means "no
 	// preference" and sends nothing.
 	ContextWindow int `json:"context_window"`
+	// ReasoningEffort is OpenAI's own `reasoning_effort`. The upstream expresses
+	// the same idea as `thinking.effort` on the model object, so it is repaired
+	// against the model's advertised levels and forwarded there.
+	ReasoningEffort string `json:"reasoning_effort"`
 	// StreamOptions mirrors OpenAI's field of the same name; only include_usage
 	// has an effect. Without it a stream never reports usage, which left every
 	// streaming client without the token counts the non-streaming response has.
 	StreamOptions *streamOptions `json:"stream_options"`
+	// MaxTokens / MaxCompletionTokens are the caller's output cap. The web lane
+	// has nowhere to put them; the mcode Messages API requires a budget, so
+	// they are forwarded there (max_completion_tokens wins when both are set,
+	// matching OpenAI's precedence).
+	MaxTokens           int `json:"max_tokens"`
+	MaxCompletionTokens int `json:"max_completion_tokens"`
 }
 
 type streamOptions struct {
@@ -243,6 +253,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// `context_window` are the two knobs the upstream's model object carries,
 	// and both are repaired here rather than rejected (see modelSelection).
 	variant, contextLimit := modelSelection(model, request.Thinking, request.ContextWindow)
+	effort := thinkingEffort(model, request.ReasoningEffort)
 
 	settings := g.settings()
 	prompt = g.outgoingText(settings, model, prompt, minimax.VideoOptions{})
@@ -285,22 +296,24 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	turn, lastErr := g.runTurn(r.Context(), turnRequest{
-		Prompt:       prompt,
-		Images:       images,
-		Files:        files,
-		Model:        model,
-		Variant:      variant,
-		ContextLimit: contextLimit,
+		Prompt:         prompt,
+		Images:         images,
+		Files:          files,
+		Model:          model,
+		Variant:        variant,
+		ContextLimit:   contextLimit,
+		ThinkingEffort: effort,
 		// The user field is caller-supplied, so the sticky key carries the
 		// client key with it: two keys that both claim user "1" must not end up
 		// pinned to the same account, where one could aim its expensive or
 		// failing requests at the other's binding.
-		SessionKey:   key.ID + ":" + request.User,
-		Started:      started,
-		OnDelta:      onDelta,
-		OnThinking:   onThinking,
-		Committed:    func() bool { return out.wroteHeader },
-		ResetStream:  splitter.reset,
+		SessionKey:  key.ID + ":" + request.User,
+		Started:     started,
+		MaxTokens:   outputTokenCap(request),
+		OnDelta:     onDelta,
+		OnThinking:  onThinking,
+		Committed:   func() bool { return out.wroteHeader },
+		ResetStream: splitter.reset,
 	})
 
 	accountName := turn.AccountName
@@ -406,10 +419,16 @@ type turnRequest struct {
 	Model        *store.ModelConfig
 	Variant      *string
 	ContextLimit int
-	SessionKey   string
-	Started      time.Time
-	OnDelta      func(string)
-	OnThinking   func(string)
+	// ThinkingEffort is the model object's `thinking.effort`, already repaired
+	// against the model's advertised levels.
+	ThinkingEffort string
+	SessionKey     string
+	Started        time.Time
+	// MaxTokens is the caller's output cap. Only protocols that require one
+	// (the mcode Messages API) read it; the web lane has no field for it.
+	MaxTokens  int
+	OnDelta    func(string)
+	OnThinking func(string)
 	// Committed reports whether the response has already begun. A retry is only
 	// safe while nothing has been written: once the caller has seen a byte, a
 	// second account would append a second answer to the first.
@@ -439,22 +458,43 @@ var errSubscriptionRequired = errors.New("subscription account required")
 // filtered pool: the upstream charges a free account for the turn and only
 // then refuses it, so trying one costs more than waiting for a plan account.
 func (g *Gateway) acquireAccount(ctx context.Context, sessionKey string, model *store.ModelConfig) (*pool.Lease, error) {
-	if model == nil || !model.SubscriptionOnly {
-		return g.pool.Acquire(ctx, sessionKey)
+	// The two lanes hold different credential types and speak different
+	// protocols, so a model only ever matches one of them. Without this filter an
+	// mcode account would be leased for a web turn (and answer 401, retiring a
+	// healthy account), and a web token would be sent to the Messages API (the
+	// same 401 with the same cost).
+	mcodeModel := model != nil && model.Upstream == store.UpstreamMCode
+	eligible := func(account *store.Account) bool {
+		if mcodeModel {
+			return account.Kind == store.KindMCode
+		}
+		return account.Kind != store.KindMCode
 	}
-	lease, err := g.pool.AcquireWith(ctx, pool.AcquireOptions{
+	if mcodeModel || (model != nil && model.SubscriptionOnly) {
+		opts := pool.AcquireOptions{
+			SessionKey: sessionKey,
+			Eligible:   eligible,
+			// Models billed against a plan are not gated by the credit balance.
+			IgnoreCreditGuard: true,
+		}
+		if model != nil && model.SubscriptionOnly {
+			opts.Eligible = func(account *store.Account) bool {
+				return eligible(account) && account.Subscribed()
+			}
+		}
+		lease, err := g.pool.AcquireWith(ctx, opts)
+		if errors.Is(err, pool.ErrNoEligible) {
+			if mcodeModel {
+				return nil, fmt.Errorf("%w: %s needs a MiniMax Code account and the pool has none", errSubscriptionRequired, model.ID)
+			}
+			return nil, fmt.Errorf("%w: %s needs a Token Plan account and the pool has none", errSubscriptionRequired, model.ID)
+		}
+		return lease, err
+	}
+	return g.pool.AcquireWith(ctx, pool.AcquireOptions{
 		SessionKey: sessionKey,
-		Eligible: func(account *store.Account) bool {
-			return account.Subscribed()
-		},
-		// These models are billed against the plan, so a zero credit balance
-		// says nothing about whether the account can serve them.
-		IgnoreCreditGuard: true,
+		Eligible:   eligible,
 	})
-	if errors.Is(err, pool.ErrNoEligible) {
-		return nil, fmt.Errorf("%w: %s needs a Token Plan account and the pool has none", errSubscriptionRequired, model.ID)
-	}
-	return lease, err
 }
 
 // runTurn leases an account, calls the upstream, and retries across accounts
@@ -495,17 +535,26 @@ func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, er
 		if attempt > 0 {
 			out.Retries = attempt
 		}
+		// MiniMax Code access tokens are short-lived; renew before the turn is
+		// built so an expiry between requests is a refresh, not a dead account.
+		if err := g.ensureMCodeToken(ctx, lease.Account); err != nil {
+			lease.Release(err)
+			lastErr = err
+			continue
+		}
 
 		opts := minimax.Options{
-			Credential:   CredentialOf(lease.Account),
-			Text:         req.Prompt,
-			Model:        req.Model.UpstreamModel,
-			Variant:      req.Variant,
-			ContextLimit: req.ContextLimit,
-			Images:       req.Images,
-			Files:        req.Files,
-			Timeout:      timeoutFor(settings, req.Model),
-			IdleTimeout:  settings.StreamIdleTimeout(),
+			Credential:     CredentialOf(lease.Account),
+			Text:           req.Prompt,
+			Model:          req.Model.UpstreamModel,
+			Variant:        req.Variant,
+			ContextLimit:   req.ContextLimit,
+			ThinkingEffort: req.ThinkingEffort,
+			Images:         req.Images,
+			Files:          req.Files,
+			Timeout:        timeoutFor(settings, req.Model),
+			IdleTimeout:    settings.StreamIdleTimeout(),
+			MaxTokens:      req.MaxTokens,
 		}
 		// A video model reached through the chat endpoint carries the same
 		// intent marker the dedicated video endpoint sends, so the upstream
@@ -692,7 +741,7 @@ func writeChunkRaw(out *respWriter, model *store.ModelConfig, delta map[string]a
 	}
 	raw, _ := json.Marshal(payload)
 	_, _ = fmt.Fprintf(out, "data: %s\n\n", raw)
-}// ------------------------------------------------------------ prompt build
+} // ------------------------------------------------------------ prompt build
 
 // conversationIsolation opens every chat turn sent upstream.
 //
@@ -1058,6 +1107,33 @@ func modelSelection(model *store.ModelConfig, thinking *bool, contextWindow int)
 		return variant, model.ContextLimit
 	}
 	return variant, 0
+}
+
+// thinkingEffort repairs a caller's `reasoning_effort` into one of the levels
+// the model advertises.
+//
+// It follows the same rule as the context window: repair rather than reject,
+// because a client that asks for "high" on a model with four levels should get
+// an answer, not a 400 about a field it never had to know about. An unread
+// catalogue (no levels — the console cannot write them) forwards the value
+// unchanged; inventing a restriction there would reject levels the upstream may
+// well accept. Empty always means "say nothing", which is the upstream default.
+func thinkingEffort(model *store.ModelConfig, requested string) string {
+	effort := strings.TrimSpace(requested)
+	if effort == "" || model == nil || len(model.EffortOptions) == 0 {
+		return effort
+	}
+	for _, option := range model.EffortOptions {
+		if strings.EqualFold(option, effort) {
+			return option
+		}
+	}
+	if model.DefaultEffort != "" {
+		return model.DefaultEffort
+	}
+	// No advertised default and an unrecognised value: say nothing rather than
+	// pick one, so the upstream applies its own.
+	return ""
 }
 
 // nearestInt picks the closest value in values, which the callers guarantee is
@@ -1992,6 +2068,7 @@ func (g *Gateway) authenticate(r *http.Request) (*store.ClientKey, error) {
 // forget when the protocol grows a field.
 func CredentialOf(account *store.Account) minimax.Credential {
 	return minimax.Credential{
+		Kind:         account.Kind,
 		Region:       account.Region,
 		Token:        account.Token,
 		UserID:       account.UserID,

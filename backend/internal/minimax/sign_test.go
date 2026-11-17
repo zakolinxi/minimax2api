@@ -51,32 +51,92 @@ func TestYYFollowsFormula(t *testing.T) {
 	// The offset has to be a whole number of milliseconds: UnixMilli truncates,
 	// so a 500-nanosecond offset would collapse onto the same instant.
 	stamp := time.Unix(1780470413, 500*int64(time.Millisecond))
-	url := "https://agent.minimax.io/archon/api/v1/session/s1/message?token=t&uuid=u"
+	target := "/minimax-cloud/api/v1/session/s1/message?token=t&uuid=u"
 	body := `{"content":"hi"}`
 
-	got := YY(url, body, stamp)
-	want := md5Hex(encodeURIComponent(url) + "_" + body + md5Hex("1780470413500") + "ooui")
+	got := YY(target, body, stamp)
+	want := md5Hex(encodeURIComponent(target) + "_" + body + md5Hex("1780470413000") + "ooui")
 	if got != want {
 		t.Fatalf("YY = %q, want %q", got, want)
 	}
 }
 
-// yy is the only header that binds the request URL, which is what makes the
-// query string order significant.
-func TestYYBindsURLAndMilliseconds(t *testing.T) {
-	stamp := time.Unix(1780470413, 500*int64(time.Millisecond))
-	url := "https://agent.minimax.io/archon/api/v1/session/s1/message?token=t"
-	body := `{"content":"hi"}`
-	base := YY(url, body, stamp)
+// The digest is over the path plus query, never the absolute URL. The bundle
+// keeps baseURL separate from url (module 52724), so anything the host
+// contributes is outside the signature — a distinction that only shows up as a
+// rejected request when it is wrong.
+func TestYYSignsThePathNotTheURL(t *testing.T) {
+	stamp := time.Unix(1780470413, 0)
+	target := "/minimax-cloud/api/v1/config?uuid=null&token=null"
 
-	if YY(url+"&uuid=u", body, stamp) == base {
+	if YY(target, "{}", stamp) == YY("https://agent.minimax.io"+target, "{}", stamp) {
+		t.Fatal("the host must not take part in the digest")
+	}
+}
+
+// yyBody is not the request body. A GET signs "{}" even though it sends
+// nothing, and a bodyless POST does too; only a POST with a body signs that
+// body. x-signature is the one that covers the raw bytes.
+func TestYYBodyFollowsTheBundle(t *testing.T) {
+	cases := []struct {
+		method string
+		body   string
+		want   string
+	}{
+		{"GET", "", "{}"},
+		{"get", `{"a":1}`, "{}"},
+		{"POST", "", "{}"},
+		{"POST", `{"content":"hi"}`, `{"content":"hi"}`},
+		{"post", `{}`, `{}`},
+	}
+	for _, tc := range cases {
+		if got := yyBody(tc.method, []byte(tc.body)); got != tc.want {
+			t.Errorf("yyBody(%q, %q) = %q, want %q", tc.method, tc.body, got, tc.want)
+		}
+	}
+}
+
+// The captured config request, byte for byte. It is the one vector that can be
+// checked without a token: an unauthenticated call carries `uuid=null` and
+// `token=null` in the signed string, and the path is all that is hashed.
+func TestYYMatchesTheLiveCapture(t *testing.T) {
+	const signedTarget = "/minimax-cloud/api/v1/config?device_platform=web&biz_id=3&app_id=3001" +
+		"&version_code=22201&unix=1794579564000&timezone_offset=28800&sys_language=en&lang=en" +
+		"&uuid=null&device_id=53809372&os_name=Windows&browser_name=Chrome&device_memory=16" +
+		"&cpu_core_num=8&browser_language=zh-CN&browser_platform=Win32&user_id=0" +
+		"&op_ticket=undefined&screen_width=800&screen_height=600&token=null&client=web&region=en"
+
+	stamp := time.UnixMilli(1794579564000)
+	if got, want := YY(signedTarget, "{}", stamp), "78d261f4a67eb4572eb33abb666d9fc2"; got != want {
+		t.Fatalf("yy = %q, want %q", got, want)
+	}
+	if got, want := YY(signedTarget, "{}", time.Unix(1794579564, 999*int64(time.Millisecond))),
+		"78d261f4a67eb4572eb33abb666d9fc2"; got != want {
+		t.Fatalf("sub-second drift must not change the digest: %q, want %q", got, want)
+	}
+	if got, want := XSignature(time.Unix(1794579564, 0), ""), "089fe6407dc8fc9b427fbbfa8fa0bbe8"; got != want {
+		t.Fatalf("x-signature = %q, want %q", got, want)
+	}
+}
+
+// yy is the only header that binds the signed target, which is what makes the
+// query string order significant.
+func TestYYBindsTargetAndSeconds(t *testing.T) {
+	stamp := time.Unix(1780470413, 500*int64(time.Millisecond))
+	target := "/minimax-cloud/api/v1/session/s1/message?token=t"
+	body := `{"content":"hi"}`
+	base := YY(target, body, stamp)
+
+	if YY(target+"&uuid=u", body, stamp) == base {
 		t.Fatal("the query string must affect the signature")
 	}
-	if YY(url, body, time.Unix(1780470414, 500*int64(time.Millisecond))) == base {
+	if YY(target, body, time.Unix(1780470414, 500*int64(time.Millisecond))) == base {
 		t.Fatal("the second must affect the signature")
 	}
-	if YY(url, body, time.Unix(1780470413, 600*int64(time.Millisecond))) == base {
-		t.Fatal("the millisecond must affect the signature")
+	// Milliseconds do not: `Date.parse(new Date().toString())` has whole-second
+	// resolution, so two readings inside one second sign the same instant.
+	if YY(target, body, time.Unix(1780470413, 600*int64(time.Millisecond))) != base {
+		t.Fatal("sub-second drift must not change the signature")
 	}
 }
 
@@ -102,11 +162,34 @@ func TestEncodeURIComponentMatchesJavaScript(t *testing.T) {
 	}
 }
 
+// formEncode is the other encoder: URLSearchParams, which builds the query
+// itself. It is not encodeURIComponent — the safe set is smaller and a space is
+// "+". The signed string is hashed verbatim, so this is pinned too.
+func TestFormEncodeMatchesURLSearchParams(t *testing.T) {
+	cases := map[string]string{
+		"abcXYZ019": "abcXYZ019",
+		"*-._":      "*-._",
+		"a b":       "a+b",
+		"a+b":       "a%2Bb",
+		"a=b&c":     "a%3Db%26c",
+		"a/b?c#d":   "a%2Fb%3Fc%23d",
+		"a~b":       "a%7Eb", // encodeURIComponent would leave "~" alone
+		"!*'()":     "%21*%27%28%29",
+		"你好":        "%E4%BD%A0%E5%A5%BD",
+	}
+	for input, want := range cases {
+		if got := formEncode(input); got != want {
+			t.Errorf("formEncode(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 // The query string is signed verbatim, so its *order* is part of the protocol:
-// `yy` digests the encoded URL, and the captured web client sends these 22
-// parameters in exactly this order — `unix` fifth, `client`/`region` last.
-// Reordering them would sign a URL the browser never sends, and the upstream
-// would reject it with a bare "invalid signature" that names no cause.
+// `yy` digests the signed target, and the captured web client sends these 22
+// parameters in exactly this order — `unix` fifth, `op_ticket` just before the
+// screen size, `client`/`region` last. Reordering them would sign a request the
+// browser never sends, and the upstream would reject it with a bare "invalid
+// signature" that names no cause.
 func TestClientQueryMatchesTheCapturedWebClient(t *testing.T) {
 	settings := configWithUpstream()
 	stamp := time.Unix(1780470413, 250*int64(time.Millisecond))
@@ -115,55 +198,76 @@ func TestClientQueryMatchesTheCapturedWebClient(t *testing.T) {
 		ScreenWidth: 1920, ScreenHeight: 1080,
 	}
 
-	got := clientQuery(settings, cred, stamp)
-	want := strings.Join([]string{
+	wire, signed := clientQuery(settings, cred, stamp)
+
+	wantWire := strings.Join([]string{
 		"device_platform=web", "biz_id=3", "app_id=3001", "version_code=22201",
-		"unix=1780470413250",
+		// `unix` is milliseconds rounded down to the second, because that is the
+		// reading the bundle signs.
+		"unix=1780470413000",
 		"timezone_offset=28800", "sys_language=en", "lang=en",
-		"uuid=u-1", "device_id=d%202",
+		"uuid=u-1", "device_id=d+2",
 		"os_name=Windows", "browser_name=Chrome", "device_memory=16", "cpu_core_num=8",
 		"browser_language=zh-CN", "browser_platform=Win32",
 		"user_id=42", "screen_width=1920", "screen_height=1080",
 		"token=a%2Bb%2Fc",
 		"client=web", "region=en",
 	}, "&")
-	if got != want {
-		t.Fatalf("clientQuery =\n %s\nwant\n %s", got, want)
+	if wire != wantWire {
+		t.Fatalf("wire query =\n %s\nwant\n %s", wire, wantWire)
+	}
+
+	// The signed string differs by exactly one parameter here: op_ticket is
+	// absent from the wire but URLSearchParams prints it as "undefined".
+	wantSigned := strings.Replace(wantWire, "user_id=42&screen_width", "user_id=42&op_ticket=undefined&screen_width", 1)
+	if signed != wantSigned {
+		t.Fatalf("signed query =\n %s\nwant\n %s", signed, wantSigned)
 	}
 }
 
-// Empty fields are dropped rather than emitted as "key=", because the signed
-// URL has to match the one actually requested. The constants survive an account
-// that carries nothing but a token, because the upstream reads them every call.
-func TestClientQuerySkipsEmptyFields(t *testing.T) {
+// Absent credential fields are the one place the two query strings disagree,
+// and the disagreement is deliberate: axios drops null/undefined, while
+// URLSearchParams prints them. Signing the wire string instead of this one is
+// the mistake that makes `yy` unverifiable upstream.
+func TestClientQueryStringifiesAbsentFieldsOnlyForTheSignature(t *testing.T) {
 	settings := configWithUpstream()
 	stamp := time.Unix(1780470413, 250*int64(time.Millisecond))
-	got := clientQuery(settings, Credential{Token: "t"}, stamp)
+	wire, signed := clientQuery(settings, Credential{Token: "t"}, stamp)
 
-	for _, dropped := range []string{"uuid=", "device_id=", "user_id="} {
-		if strings.Contains(got, dropped) {
-			t.Errorf("clientQuery should omit the empty %q: %s", dropped, got)
+	for _, dropped := range []string{"uuid=", "op_ticket="} {
+		if strings.Contains(wire, dropped) {
+			t.Errorf("wire query should omit %q: %s", dropped, wire)
 		}
 	}
-	// The credential fields are the ones that vanish; the constants around them
-	// keep their positions, which is what keeps the digest stable.
-	if !strings.Contains(got, "&token=t&client=web&region=en") {
-		t.Errorf("clientQuery should keep the trailing constants: %s", got)
+	// Real client-side defaults are zeros, not omissions: `device_id` falls back
+	// to a generated value and `user_id` to 0.
+	for _, want := range []string{"device_id=0", "user_id=0", "&token=t&client=web&region=en"} {
+		if !strings.Contains(wire, want) {
+			t.Errorf("wire query is missing %q: %s", want, wire)
+		}
+	}
+	for _, want := range []string{"uuid=null", "op_ticket=undefined", "token=t"} {
+		if !strings.Contains(signed, want) {
+			t.Errorf("signed query is missing the placeholder %q: %s", want, signed)
+		}
+	}
+	if !strings.Contains(signed, "uuid=null&device_id") {
+		t.Errorf("uuid must stay in position in the signed query: %s", signed)
 	}
 	for _, want := range []string{
 		"device_platform=web", "timezone_offset=28800", "browser_platform=Win32",
 	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("clientQuery is missing the constant %q: %s", want, got)
+		if !strings.Contains(signed, want) {
+			t.Errorf("signed query is missing the constant %q: %s", want, signed)
 		}
 	}
 }
 
-// `unix` and `yy` have to describe the same request. The web client carries the
-// millisecond clock in its query and `yy` digests the encoded URL, so a second
-// clock reading — even a few milliseconds later — would make the digest cover a
-// URL that was never sent. The failure mode is a bare "invalid signature" that
-// points at nothing, so the seam is pinned rather than trusted.
+// `unix` and `yy` have to describe the same request. They come from one clock
+// reading, and `yy` covers the signed target rather than the URL, so a second
+// reading — even a few milliseconds later — would sign an instant that was
+// never sent. The failure mode is a bare "invalid signature" that points at
+// nothing, so the seam is pinned rather than trusted.
 func TestUnixAndYYComeFromOneClockReading(t *testing.T) {
 	settings := configWithUpstream()
 	stamp := time.Unix(1780470413, 250*int64(time.Millisecond))
@@ -171,22 +275,33 @@ func TestUnixAndYYComeFromOneClockReading(t *testing.T) {
 	cred := Credential{Token: "t", UUID: "u", DeviceID: "12345678", UserID: "42"}
 
 	body := []byte(`{}`)
-	req, err := client.newRequest(context.Background(), settings, cred, http.MethodPost,
-		requestTarget{Path: messagePath(settings), SessionID: "s1", Stream: true}, body)
+	target := requestTarget{Path: messagePath(settings), SessionID: "s1", Stream: true}
+	req, err := client.newRequest(context.Background(), settings, cred, http.MethodPost, target, body)
 	if err != nil {
 		t.Fatalf("newRequest: %v", err)
 	}
 
-	if !strings.Contains(req.URL.RawQuery, "unix=1780470413250") {
-		t.Fatalf("request URL should carry the millisecond clock: %q", req.URL.String())
+	if !strings.Contains(req.URL.RawQuery, "unix=1780470413000") {
+		t.Fatalf("request URL should carry the second-aligned clock: %q", req.URL.String())
 	}
 	if got, want := req.Header.Get("x-timestamp"), "1780470413"; got != want {
 		t.Errorf("x-timestamp = %q, want %q", got, want)
 	}
-	// The digest must verify against the URL that is actually sent, not the one
-	// that went in — Go parses and re-serialises it on the way through.
-	if got, want := req.Header.Get("yy"), YY(req.URL.String(), string(body), stamp); got != want {
-		t.Errorf("yy = %q, want %q (over %q)", got, want, req.URL.String())
+
+	// Rebuild the signed target independently and check the header against it.
+	path := strings.ReplaceAll(target.Path, "{session_id}", target.SessionID)
+	_, signedTarget := client.buildURLWith(client.baseURL(settings, cred), settings, cred, target.Path, target.SessionID, stamp)
+	if !strings.HasPrefix(signedTarget, path+"?") {
+		t.Fatalf("signed target should be path-based: %q", signedTarget)
+	}
+	if strings.Contains(signedTarget, "://") {
+		t.Fatalf("signed target must not carry the host: %q", signedTarget)
+	}
+	if got, want := req.Header.Get("yy"), YY(signedTarget, "{}", stamp); got != want {
+		t.Errorf("yy = %q, want %q (over %q)", got, want, signedTarget)
+	}
+	if got := req.Header.Get("yy"); got == YY(req.URL.String(), "{}", stamp) {
+		t.Error("yy must not be computed over the absolute URL")
 	}
 }
 

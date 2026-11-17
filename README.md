@@ -204,6 +204,33 @@ web 端令牌（JWT）里的 `exp` 一到，所有调用都会 401，而且**过
 - ⚠️ 密码**明文保存在数据目录的 `app.json` 里**（和令牌同级），只用于自动重登，不会出现在任何 API 返回或导出文件里。请把 `data/` 当密钥目录看待。
 - 自动重登只换令牌，不改密码；在网页端改了密码后，要回控制台更新一次。
 
+### MiniMax Code 账号（OAuth 设备码）
+
+除了 web 端 JWT，号池还能放 **MiniMax Code 桌面端**的账号。它和 web 账号是两条互不相通的通道：web 账号用 `token` + `x-signature`/`yy` 调 `/minimax-cloud` 和 `/matrix`；Code 账号用 OAuth bearer 调 `/mavis/api/v1/llm/v1/messages`（Anthropic Messages 协议），**不需要签名头**。调度按账号类型分池，两种账号不会串用。
+
+三种入场方式（都要管理台登录）：
+
+```bash
+# 1) 设备码：返回 userCode + 链接，浏览器里授权后自动落库
+curl -X POST http://127.0.0.1:8080/admin/api/accounts/mcode/device \
+  -H "Authorization: Bearer <管理台会话>" -d '{"region":"global"}'
+# 轮询结果（status: pending / authorized / denied / expired）
+curl http://127.0.0.1:8080/admin/api/accounts/mcode/device/<id> -H "Authorization: Bearer <管理台会话>"
+
+# 2) 粘贴 token（只要 accessToken 即可，校验走模型列表）
+curl -X POST http://127.0.0.1:8080/admin/api/accounts/mcode/token \
+  -H "Authorization: Bearer <管理台会话>" \
+  -d '{"accessToken":"mmoat_...","refreshToken":"mmort_...","region":"global"}'
+
+# 3) 从本机桌面端导入（默认只读校验，不动原凭据）
+curl -X POST http://127.0.0.1:8080/admin/api/accounts/mcode/import-local \
+  -H "Authorization: Bearer <管理台会话>" -d '{}'
+```
+
+> ⚠️ **`refresh=true` 会轮换凭据**。OAuth 刷新成功后旧的 refresh token 立即失效，也就是**把正在用这份凭据的桌面端顶下线**。所以粘贴/导入默认只做「模型列表」校验，不刷新；只有明确想接管那份凭据时才加 `"refresh":true`，并且在桌面端重新登录一次。账号详情里的 `tokenExpiresAt` 来自签发时返回的 `expires_in`（约 12 小时），网关会在到期前 10 分钟自动续期。
+
+模型条目也由上游决定。控制台「模型」页的 **同步 MiniMax Code 模型**（`POST /admin/api/models/mcode-sync`）会读 `/mavis/api/v1/models` 并对齐 `mcode-*` 条目：按上游模型 id 匹配，只重写上下文/思考/effort 等能力参数，保留你改过的名称、启用状态与计数；上游删掉的模型会被**停用**而不是删除。
+
 ### 调用
 
 ```bash
@@ -235,6 +262,8 @@ curl http://127.0.0.1:8080/v1/messages \
 | `minimax-agent` | chat | 通用 Agent，自动规划并调用工具（默认） |
 | `minimax-m3.1-flash` | chat | 最新旗舰 Flash，强制思考；上下文 **512K / 1M** |
 | `minimax-m3` | chat | 上一代旗舰，思考可开关；上下文 450K |
+| `mcode-m3.1-flash` | chat | **MiniMax Code 通道**（OAuth bearer + Anthropic Messages），M3.1 Flash，512K / 1M |
+| `mcode-m3` | chat | **MiniMax Code 通道**，M3，思考可开关 |
 | `minimax-image` | image | 图像生成 |
 | `minimax-h3` | video | H3.0，质量优先，**仅限订阅账号（Token Plan）**，**768P / 2K** |
 | `minimax-h3-max` | video | H3 Max，约 20 秒完成（唯一能同步返回的），**仅限订阅账号（Token Plan）**，**480P / 768P** |
@@ -277,7 +306,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 - `thinking`（boolean）：`true` 开、`false` 关。`minimax-m3` 可开关；`minimax-m3.1-flash` 上游强制开启，传 `false` 也仍然会思考。不传则用上游默认。
-- `context_window`（number）：`minimax-m3.1-flash` 支持 `512000` / `1000000`，其它值**就近取整**而不是报错（1M 更费额度）；`minimax-m3` 只有 450000，传别的值会落回它。不传用模型默认。
+- `reasoning_effort`（string）：上游 `thinking.effort`，`minimax-m3.1-flash` 接受 `default` / `low` / `medium` / `high` / `xhigh` / `max`。大小写不敏感；不在列表里的值会落回该模型的默认档（`default`）而不是报错。不传则不发这个字段，用上游默认。
+- `context_window`（number）：`minimax-m3.1-flash` 支持 `512000` / `1000000`，其它值**就近取整**而不是报错（1M 更费额度）；`minimax-m3` 只有 400000，传别的值会落回它。不传用模型默认。
 - `/v1/messages` 用 Anthropic 自己的写法：`"thinking":{"type":"enabled"}`，映射到同一个 `variant`。
 
 ### 视频生成
@@ -415,11 +445,19 @@ MiniMax Agent 没有公开 API，这里是把它 Web 端的调用方式复刻出
 | `token` | 账号的 JWT |
 | `x-timestamp` | 当前 Unix 秒 |
 | `x-signature` | `MD5(秒级时间戳 + 静态盐 + 请求体)` |
-| `yy` | `MD5(encodeURIComponent(完整URL) + "_" + 请求体 + MD5(毫秒级时间戳) + "ooui")` |
+| `yy` | `MD5(encodeURIComponent(path + query) + "_" + yyBody + MD5(毫秒时间戳) + "ooui")` |
 
-`x-signature` 与 URL 无关；**`yy` 绑定了完整 URL**，而 URL 的 query 里装着指纹字段。所以 **query 的参数顺序也是协议的一部分**——实现里没用 `net/url` 的 `Values.Encode()`（会按键排序），而是按固定顺序手工拼接。
+`x-signature` 与 URL 无关。`yy` 有三个容易踩的点，任何一个错了都只得到一句不指向任何原因的 `invalid signature`：
 
-> Go 的 `url.QueryEscape` 不能替代 JS 的 `encodeURIComponent`（空格、`~`、`!*'()` 的处理正好相反），所以后者是照着 JS 语义自己实现的，并有逐字符单元测试钉住。
+1. **签的是 path + query，不是完整 URL。** 前端 axios 把 `baseURL` 与 `url` 分开保存，签名函数拿到的只有 `url`。协议里“域名不参与签名”。
+2. **时间戳是毫秒，但被截断到秒**（`Date.parse(new Date().toString())`），例如 `1794579564000`；同一个读数除以 1000 就是 `x-timestamp`。
+3. **签名用的 query 和线上 URL 的 query 不是同一个字符串。** 前端用 `new URLSearchParams(对象)` 生成待签名串，`null`/`undefined` 会被打印成字面量 `null`/`undefined`；而 axios 真正发请求时会把它们丢掉。所以签名串里有 `uuid=null`、`op_ticket=undefined`、`token=null`，线上 URL 里没有。
+
+`yyBody` 也不是请求体：GET 恒为 `"{}"`；无 body 的 POST 同样为 `"{}"`；只有带 body 的 POST 才用 `JSON.stringify(body)`。
+
+query 的参数顺序同样是协议的一部分——实现里没用 `net/url` 的 `Values.Encode()`（会按键排序），而是按固定顺序手工拼接。
+
+> Go 的 `url.QueryEscape` 不能替代 JS 的 `encodeURIComponent`（空格、`~`、`!*'()` 的处理正好相反），所以后者是照着 JS 语义自己实现的，并有逐字符单元测试钉住。而 query 值本身用的是 `URLSearchParams` 的编码（空格变 `+`），两者不能混用。
 
 ### 账号身份与出口 IP
 
@@ -461,9 +499,11 @@ GET /minimax-cloud/api/v1/channel/connections
 
 ### 流式解析
 
-适配器**按 payload 字段分流，不依赖上游的事件类型编号**：判断依据是 payload 里出现了 `msg_content` 还是 `reasoning_content`，未知帧安全跳过。上游重新编号不会让解析器静默失效。
+适配器**按 payload 字段分流，不依赖上游的事件类型编号**：判断依据是 payload 里出现了 `msg_content` 还是 `thinking_content`，未知帧安全跳过。上游重新编号不会让解析器静默失效。
 
 一个容易踩的坑：上游为**每条**消息发两帧——`agent_message_chunk` 是增量流（正文的唯一来源），`agent_message` 是整条重述（含 `role: "user"` 的请求回显）。只认 `msg_content` 键名而不看容器和角色，就会把**人设和全部历史跟着答案一起返回**，并把答案说两遍。适配器按容器分流，回显帧直接丢弃。
+
+`agent_message_chunk` 里的 `tool_calls[]`（`id` / `name` / `args` / `argsDelta` / `status` / `result` / `durationMs`）会被收集进 `Result.ToolCalls`，按 `id` 合并。这些是 **Agent 自己的工具调用**（视频插件、搜索等），不是调用方声明的函数，所以不会作为 OpenAI `tool_calls` 回吐给客户端——那会把一个客户端从未注册过的函数名塞给它。要观测原始帧用 `Options.OnFrame`。
 
 ---
 

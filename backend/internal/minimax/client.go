@@ -147,6 +147,10 @@ type MediaRef struct {
 // `yy` header is computed over the query string built from them, so a token
 // only works when it travels with the fingerprint it was issued to.
 type Credential struct {
+	// Kind selects the upstream protocol: "" / "token" / "guest" are the web
+	// agent (JWT + x-signature/yy), "mcode" is the MiniMax Code desktop lane
+	// (OAuth bearer + Anthropic Messages).
+	Kind         string
 	Region       string
 	Token        string
 	UserID       string
@@ -171,6 +175,23 @@ func (c Credential) Label() string {
 	return c.Token
 }
 
+// ToolCall is one entry of a chunk's `tool_calls`, as the upstream reports it.
+//
+// These are the *agent's* own tool invocations — the same events the web UI
+// renders as "using the video plugin" — not function calls the API caller
+// declared. They are collected for observability, not re-emitted as OpenAI
+// tool_calls: doing the latter would hand a client a name it never registered.
+type ToolCall struct {
+	ID   string `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
+	// Args accumulates `argsDelta`; `args` replaces it when the upstream sends
+	// the whole payload in one frame.
+	Args       string `json:"args,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Result     string `json:"result,omitempty"`
+	DurationMS int64  `json:"durationMs,omitempty"`
+}
+
 // Result is the aggregated outcome of one completion.
 type Result struct {
 	Text       string
@@ -180,6 +201,10 @@ type Result struct {
 	MessageID  string
 	TurnID     string
 	StopReason string
+
+	// ToolCalls are the agent-side tool invocations seen in this turn, keyed by
+	// id and in first-seen order. Empty for a plain answer.
+	ToolCalls []ToolCall
 
 	// Completed and CompletedThinking hold the whole-message restatement that
 	// closes a turn (see messageFrameOf). They are a fallback for a stream that
@@ -216,15 +241,33 @@ type Options struct {
 	// ContextLimit asks for a context window, in tokens. Zero omits the field
 	// and leaves the upstream default in place.
 	ContextLimit int
-	Images       []UploadedImage
+	// Reasoning is the model object's `reasoning` flag. Nil omits the field.
+	//
+	// The web client's serialiser (module 81775) forwards it whenever the
+	// selection carries one, but the current `/config` catalogue never sets it
+	// and no live request has been captured with it. It is therefore plumbed
+	// through faithfully and left off unless a caller asks for it — inventing a
+	// value here would be a guess with a 400 as its only feedback.
+	Reasoning *bool
+	// ThinkingEffort is the model object's `thinking.effort`. Empty omits the
+	// field, which is what the upstream treats as its `default_effort`.
+	//
+	// The catalogue reports the accepted values per model (`effort_options`),
+	// e.g. default/low/medium/high/xhigh/max on M3.1-Flash. See
+	// gateway.thinkingEffort for the repair rule.
+	ThinkingEffort string
+	Images         []UploadedImage
 	// Files ride along as `meta`/`cloud` attachment envelopes after being
 	// pushed to the object store with the turn's own credential. See
 	// PendingAttachment for why the upload cannot happen earlier.
 	Files       []PendingAttachment
 	Timeout     time.Duration
 	IdleTimeout time.Duration
-	OnDelta     func(string)
-	OnThinking  func(string)
+	// MaxTokens caps the reply on protocols that require an output budget
+	// (Anthropic Messages does). Zero leaves the default to the client.
+	MaxTokens  int
+	OnDelta    func(string)
+	OnThinking func(string)
 	// OnFrame sees every decoded frame, before anything decides what it means.
 	//
 	// Dispatch is driven by payload keys, which is what keeps the adapter
@@ -352,25 +395,33 @@ func messagePath(settings config.Settings) string {
 	return DefaultMessagePath
 }
 
-// clientQuery renders the metadata query string in the exact order the captured
-// web client sends it: 22 parameters, with `unix` fifth and `client`/`region`
-// last.
+// clientQuery renders the client metadata in the exact order the captured web
+// client sends it, and returns it twice.
 //
-// The order is part of the contract. `yy` is an MD5 over the encoded URL, so
-// reordering the parameters changes the digest and the upstream rejects the
-// request — with a message that names none of this. url.Values.Encode() sorts
-// keys and therefore cannot be used here.
+// The two strings differ on purpose, and that difference is the single most
+// common way a hand-written client gets `yy` wrong:
 //
-// Most of these are not load-bearing for routing; `uuid`, `device_id`,
-// `user_id`, the screen size and the token are. The rest describe the same
-// browser session and were present on the captured request, and sending a
-// narrower set is what makes a request look like something other than the web
-// client. They cost nothing.
+//   - wire goes on the request URL. It is what axios actually transmits, and
+//     axios drops `null`/`undefined` parameters.
+//   - signed is what the bundle hashes. It is built with
+//     `new URLSearchParams(params)`, which stringifies those same absent values
+//     as "null"/"undefined" — so the signed string carries `uuid=null`,
+//     `op_ticket=undefined` and `token=null` even though the wire URL carries
+//     none of them.
 //
-// `unix` comes from the caller's clock rather than a reading taken here, because
-// it has to be the same reading that feeds `yy`: a second time.Now() a
-// millisecond later would sign a URL that was never sent.
-func clientQuery(settings config.Settings, cred Credential, now time.Time) string {
+// Reusing one string for both produces a digest the upstream never computes.
+// Deliberately so, or at least unavoidably so: `yy` covers the client's own
+// parameter map, not the request it becomes.
+//
+// The order is part of the contract too. url.Values.Encode() sorts keys and
+// therefore cannot be used here.
+//
+// Values are encoded the way URLSearchParams encodes them — a space becomes
+// "+", not "%20" — because the signed string is hashed verbatim. `unix` comes
+// from the caller's clock rather than a reading taken here: it has to be the
+// same reading that feeds `yy`, and a second time.Now() would sign an instant
+// that was never sent.
+func clientQuery(settings config.Settings, cred Credential, now time.Time) (wire, signed string) {
 	width := cred.ScreenWidth
 	if width <= 0 {
 		width = settings.Upstream.ScreenWidth
@@ -380,62 +431,99 @@ func clientQuery(settings config.Settings, cred Credential, now time.Time) strin
 		height = settings.Upstream.ScreenHeight
 	}
 
-	pairs := make([]string, 0, 24)
-	add := func(key, value string) {
-		if value == "" {
-			return
-		}
-		pairs = append(pairs, key+"="+encodeURIComponent(value))
+	// Every entry carries both readings. `wireValue` empty means axios would
+	// have dropped it; `signedValue` is what URLSearchParams would have
+	// printed, which for an absent credential field is the literal "null".
+	type pair struct{ key, wireValue, signedValue string }
+	unixMillis := strconv.FormatInt(signatureMillis(now), 10)
+	pairs := []pair{
+		{"device_platform", "web", "web"},
+		{"biz_id", "3", "3"},
+		{"app_id", "3001", "3001"},
+		{"version_code", "22201", "22201"},
+		{"unix", unixMillis, unixMillis},
+		{"timezone_offset", "28800", "28800"},
+		{"sys_language", "en", "en"},
+		{"lang", "en", "en"},
+		{"uuid", cred.UUID, orLiteral(cred.UUID, "null")},
+		{"device_id", orLiteral(cred.DeviceID, "0"), orLiteral(cred.DeviceID, "0")},
+		{"os_name", "Windows", "Windows"},
+		{"browser_name", "Chrome", "Chrome"},
+		{"device_memory", "16", "16"},
+		{"cpu_core_num", "8", "8"},
+		{"browser_language", "zh-CN", "zh-CN"},
+		{"browser_platform", "Win32", "Win32"},
+		{"user_id", orLiteral(cred.UserID, "0"), orLiteral(cred.UserID, "0")},
+		// op_ticket is `d?.op_ticket` upstream: absent for a cloud web session,
+		// which URLSearchParams prints as "undefined". It is never transmitted,
+		// because axios drops undefined params.
+		{"op_ticket", "", "undefined"},
+		{"screen_width", strconv.Itoa(width), strconv.Itoa(width)},
+		{"screen_height", strconv.Itoa(height), strconv.Itoa(height)},
+		{"token", cred.Token, orLiteral(cred.Token, "null")},
+		{"client", "web", "web"},
+		{"region", "en", "en"},
 	}
 
-	add("device_platform", "web")
-	add("biz_id", "3")
-	add("app_id", "3001")
-	add("version_code", "22201")
-	add("unix", strconv.FormatInt(now.UnixMilli(), 10))
-	add("timezone_offset", "28800")
-	add("sys_language", "en")
-	add("lang", "en")
-	add("uuid", cred.UUID)
-	add("device_id", cred.DeviceID)
-	add("os_name", "Windows")
-	add("browser_name", "Chrome")
-	add("device_memory", "16")
-	add("cpu_core_num", "8")
-	add("browser_language", "zh-CN")
-	add("browser_platform", "Win32")
-	add("user_id", cred.UserID)
-	add("screen_width", strconv.Itoa(width))
-	add("screen_height", strconv.Itoa(height))
-	add("token", cred.Token)
-	add("client", "web")
-	add("region", "en")
-	return strings.Join(pairs, "&")
+	wirePairs := make([]string, 0, len(pairs))
+	signedPairs := make([]string, 0, len(pairs))
+	for _, item := range pairs {
+		if item.wireValue != "" {
+			wirePairs = append(wirePairs, item.key+"="+formEncode(item.wireValue))
+		}
+		signedPairs = append(signedPairs, item.key+"="+formEncode(item.signedValue))
+	}
+	return strings.Join(wirePairs, "&"), strings.Join(signedPairs, "&")
 }
 
-// buildURLWith assembles the exact URL that will be requested, so the same
-// string can be fed to the signature. Substitution happens here rather than
-// through net/url so the query order survives byte for byte.
-func (c *Client) buildURLWith(base string, settings config.Settings, cred Credential, path, sessionID string, now time.Time) string {
+// orLiteral returns value when it is set and fallback otherwise.
+func orLiteral(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+// buildURLWith assembles the exact URL that will be requested.
+//
+// It also returns the *signed target* — the path plus the signed query string —
+// because `yy` covers that and not the URL. The two differ in more than the
+// host: the signed query keeps the "null"/"undefined" placeholders the URL must
+// not carry. See clientQuery.
+func (c *Client) buildURLWith(base string, settings config.Settings, cred Credential, path, sessionID string, now time.Time) (rawURL, signedTarget string) {
 	path = strings.ReplaceAll(path, "{agent_id}", c.agentID(settings, cred))
 	path = strings.ReplaceAll(path, "{session_id}", sessionID)
 
-	rawURL := strings.TrimRight(base, "/") + path
-	if query := clientQuery(settings, cred, now); query != "" {
-		// A path that carries its own query needs "&", not a second "?". The
-		// difference is invisible in the URL and fatal to the signature.
-		if strings.Contains(rawURL, "?") {
-			rawURL += "&" + query
-		} else {
-			rawURL += "?" + query
-		}
+	wireQuery, signedQuery := clientQuery(settings, cred, now)
+
+	signedTarget = path
+	if signedQuery != "" {
+		signedTarget += joinQuery(path, signedQuery)
 	}
-	return rawURL
+
+	rawURL = strings.TrimRight(base, "/") + path
+	if wireQuery != "" {
+		rawURL += joinQuery(path, wireQuery)
+	}
+	return rawURL, signedTarget
+}
+
+// joinQuery appends a query string to a path that may already carry one.
+//
+// The difference between "?" and "&" is one byte and invisible in the URL, but
+// `yy` covers the string verbatim, so getting it wrong rejects the request for
+// a reason that names nothing.
+func joinQuery(path, query string) string {
+	if strings.Contains(path, "?") {
+		return "&" + query
+	}
+	return "?" + query
 }
 
 // buildURL targets the account's API host.
 func (c *Client) buildURL(settings config.Settings, cred Credential, path, sessionID string, now time.Time) string {
-	return c.buildURLWith(c.baseURL(settings, cred), settings, cred, path, sessionID, now)
+	rawURL, _ := c.buildURLWith(c.baseURL(settings, cred), settings, cred, path, sessionID, now)
+	return rawURL
 }
 
 // streamBaseURL is the host the conversation endpoint answers on.
@@ -515,7 +603,7 @@ func (c *Client) newRequest(ctx context.Context, settings config.Settings, cred 
 	if target.Stream {
 		base = streamBaseURL(settings, base)
 	}
-	rawURL := c.buildURLWith(base, settings, cred, target.Path, target.SessionID, now)
+	rawURL, signedTarget := c.buildURLWith(base, settings, cred, target.Path, target.SessionID, now)
 
 	var reader io.Reader
 	if body != nil {
@@ -544,10 +632,14 @@ func (c *Client) newRequest(ctx context.Context, settings config.Settings, cred 
 	req.Header.Set("user-agent", settings.Upstream.UserAgent)
 
 	// The three headers the web bundle attaches to every API call.
+	//
+	// x-timestamp and yy come from one reading, and yy's target is the signed
+	// path — not rawURL. Signing the URL is the mistake this client shipped
+	// with for a long time; see YY.
 	req.Header.Set("token", cred.Token)
 	req.Header.Set("x-timestamp", strconv.FormatInt(now.Unix(), 10))
 	req.Header.Set("x-signature", XSignature(now, bodyText))
-	req.Header.Set("yy", YY(rawURL, bodyText, now))
+	req.Header.Set("yy", YY(signedTarget, yyBody(method, body), now))
 	return req, nil
 }
 
@@ -586,27 +678,27 @@ func (c *Client) clientForProxy(raw string) (*http.Client, error) {
 		c.proxyTransport.CloseIdleConnections()
 	}
 	c.proxyTransport = &http.Transport{
-			Proxy: func(target *http.Request) (*url.URL, error) {
-				// Loopback never goes through the proxy.
-				//
-				// A proxy is configured to reach the internet, and an upstream
-				// on 127.0.0.1 is by definition not there. Sending it anyway
-				// hands the request to a proxy that cannot reach it and gets
-				// back `502` with an empty body — which reads as the upstream
-				// being down rather than as a misrouted request. That is
-				// exactly how a local test upstream fails when the console has
-				// a proxy set, and it is worth being correct about beyond the
-				// test: a per-account base URL pointing at a local mirror is a
-				// supported thing to configure.
-				if isLoopbackHost(target.URL.Hostname()) {
-					return nil, nil
-				}
-				return proxyURL, nil
-			},
-			MaxIdleConns:        64,
-			MaxIdleConnsPerHost: 16,
-			IdleConnTimeout:     90 * time.Second,
-		}
+		Proxy: func(target *http.Request) (*url.URL, error) {
+			// Loopback never goes through the proxy.
+			//
+			// A proxy is configured to reach the internet, and an upstream
+			// on 127.0.0.1 is by definition not there. Sending it anyway
+			// hands the request to a proxy that cannot reach it and gets
+			// back `502` with an empty body — which reads as the upstream
+			// being down rather than as a misrouted request. That is
+			// exactly how a local test upstream fails when the console has
+			// a proxy set, and it is worth being correct about beyond the
+			// test: a per-account base URL pointing at a local mirror is a
+			// supported thing to configure.
+			if isLoopbackHost(target.URL.Hostname()) {
+				return nil, nil
+			}
+			return proxyURL, nil
+		},
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     90 * time.Second,
+	}
 	c.proxyClient = &http.Client{Transport: c.proxyTransport}
 	c.proxyFor = raw
 	return c.proxyClient, nil
@@ -748,6 +840,14 @@ func (c *Client) Completion(ctx context.Context, opts Options) (*Result, error) 
 	}
 	if opts.Text == "" && len(opts.Images) == 0 && len(opts.Files) == 0 {
 		return nil, errors.New("empty prompt")
+	}
+
+	// MiniMax Code speaks a different protocol on the same product: an OAuth
+	// bearer, the Anthropic Messages wire format, and no signature headers. It
+	// is dispatched here rather than in the gateway so retries, cooldowns and
+	// audits keep the single path they were built around.
+	if isMCodeCredential(opts.Credential) {
+		return c.mcodeCompletion(ctx, opts)
 	}
 
 	timeout := opts.Timeout
@@ -943,8 +1043,14 @@ func buildMessageBody(settings config.Settings, opts Options, turnID string) map
 			"provider_id": upstreamProviderID,
 			"model_id":    opts.Model,
 		}
+		if opts.Reasoning != nil {
+			selection["reasoning"] = *opts.Reasoning
+		}
 		if opts.Variant != nil {
 			selection["variant"] = *opts.Variant
+		}
+		if effort := strings.TrimSpace(opts.ThinkingEffort); effort != "" {
+			selection["thinking"] = map[string]any{"effort": effort}
 		}
 		if opts.ContextLimit > 0 {
 			selection["context_limit"] = opts.ContextLimit
@@ -1146,6 +1252,14 @@ func (c *Client) handleFrame(block string, opts Options, result *Result) error {
 		}
 	}
 
+	// Tool invocations ride inside the same message containers as the text.
+	// They are recorded rather than streamed on: see ToolCall.
+	if content != nil {
+		collectToolCalls(content, result)
+	} else {
+		collectToolCalls(frame.Data, result)
+	}
+
 	collectMediaDeep(frame.Data, result)
 	if status := deepString(frame.Data, "finish_reason"); status != "" {
 		result.StopReason = status
@@ -1271,6 +1385,103 @@ func deepString(payload any, key string) string {
 		}
 	}
 	return ""
+}
+
+// collectToolCalls records the agent-side tool invocations carried by a frame.
+//
+// The stream reports them incrementally: a first frame names the tool and
+// usually carries an empty `args`, later frames append `argsDelta`. Frames are
+// merged by id, in first-seen order, so a caller reading Result.ToolCalls sees
+// one entry per invocation rather than one per chunk.
+//
+// A missing id is not a parse failure — some event kinds omit it — so an entry
+// without one is matched against the last unfinished call of the same name.
+func collectToolCalls(payload any, result *Result) {
+	var entries []map[string]any
+	switch node := payload.(type) {
+	case map[string]any:
+		if list, ok := node["tool_calls"].([]any); ok {
+			for _, item := range list {
+				if entry, ok := item.(map[string]any); ok {
+					entries = append(entries, entry)
+				}
+			}
+		}
+		if single, ok := node["tool_call"].(map[string]any); ok {
+			entries = append(entries, single)
+		}
+	}
+	for _, entry := range entries {
+		id := stringField(entry, "id")
+		name := stringField(entry, "name")
+		index := -1
+		for i := range result.ToolCalls {
+			call := &result.ToolCalls[i]
+			if id != "" && call.ID == id {
+				index = i
+				break
+			}
+			if id == "" && call.Name == name && !toolCallFinished(call.Status) {
+				index = i
+			}
+		}
+		if index < 0 {
+			result.ToolCalls = append(result.ToolCalls, ToolCall{ID: id, Name: name})
+			index = len(result.ToolCalls) - 1
+		}
+		call := &result.ToolCalls[index]
+		if call.ID == "" {
+			call.ID = id
+		}
+		if call.Name == "" {
+			call.Name = name
+		}
+		if whole := stringField(entry, "args"); whole != "" {
+			call.Args = whole
+		}
+		if delta := stringField(entry, "argsDelta"); delta != "" {
+			call.Args += delta
+		}
+		if status := stringField(entry, "status"); status != "" {
+			call.Status = status
+		}
+		if value := stringField(entry, "result"); value != "" {
+			call.Result = value
+		}
+		if value, ok := int64Field(entry, "durationMs"); ok {
+			call.DurationMS = value
+		}
+	}
+}
+
+// toolCallFinished reports whether a status means the invocation is over, which
+// stops an id-less delta from attaching to it.
+func toolCallFinished(status string) bool {
+	switch strings.ToLower(status) {
+	case "success", "succeeded", "error", "failed", "cancelled", "canceled", "finished", "completed":
+		return true
+	}
+	return false
+}
+
+// int64Field reads a whole number that may arrive as float64 (the default for
+// encoding/json) or as a string.
+func int64Field(payload map[string]any, key string) (int64, bool) {
+	switch value := payload[key].(type) {
+	case float64:
+		return int64(value), true
+	case int64:
+		return value, true
+	case json.Number:
+		if parsed, err := value.Int64(); err == nil {
+			return parsed, true
+		}
+	case string:
+		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
 }
 
 // collectMediaDeep walks the payload for finished image or video URLs.

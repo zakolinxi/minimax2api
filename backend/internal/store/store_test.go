@@ -727,6 +727,71 @@ func TestMergeBuiltinModelsBackfillsContextAndThinking(t *testing.T) {
 	}
 }
 
+// A context window this gateway guessed wrong has to be corrected, not just
+// backfilled: 450000 was hard-coded before `/config` was read, and the upstream
+// reports 400000. Since the value is non-zero, the "adopt only when empty" rule
+// leaves it alone — so the correction needs its own path. The console cannot
+// write this field, which is what makes overwriting it safe.
+func TestMergeBuiltinModelsCorrectsTheM3ContextGuess(t *testing.T) {
+	stored := BuiltinModels()
+	for _, model := range stored {
+		if model.ID == "minimax-m3" {
+			model.ContextLimit = 450000
+		}
+	}
+	merged, changed := MergeBuiltinModels(stored)
+	if !changed {
+		t.Fatal("the stale guess should report a change")
+	}
+	for _, model := range merged {
+		if model.ID != "minimax-m3" {
+			continue
+		}
+		if model.ContextLimit != 400000 {
+			t.Fatalf("M3 context = %d, want the upstream's 400000", model.ContextLimit)
+		}
+	}
+
+	// An operator's own number is still left alone: only the exact stale guess
+	// is rewritten.
+	stored = BuiltinModels()
+	for _, model := range stored {
+		if model.ID == "minimax-m3" {
+			model.ContextLimit = 350000
+		}
+	}
+	merged, _ = MergeBuiltinModels(stored)
+	for _, model := range merged {
+		if model.ID == "minimax-m3" && model.ContextLimit != 350000 {
+			t.Fatalf("M3 context = %d, want the stored 350000", model.ContextLimit)
+		}
+	}
+}
+
+// The effort levels are another upstream fact the console cannot edit, so a
+// frozen entry without them adopts the built-in's list.
+func TestMergeBuiltinModelsBackfillsEffortLevels(t *testing.T) {
+	stored := BuiltinModels()
+	for _, model := range stored {
+		model.EffortOptions, model.DefaultEffort = nil, ""
+	}
+	merged, changed := MergeBuiltinModels(stored)
+	if !changed {
+		t.Fatal("a catalogue stripped of its effort levels should report a change")
+	}
+	for _, model := range merged {
+		if model.ID != "minimax-m3.1-flash" {
+			continue
+		}
+		if got := strings.Join(model.EffortOptions, "/"); got != "default/low/medium/high/xhigh/max" {
+			t.Errorf("M3.1-Flash effort options = %s", got)
+		}
+		if model.DefaultEffort != "default" {
+			t.Errorf("M3.1-Flash default effort = %q", model.DefaultEffort)
+		}
+	}
+}
+
 func intStrings(values []int) []string {
 	out := make([]string, len(values))
 	for index, value := range values {

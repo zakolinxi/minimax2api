@@ -204,10 +204,31 @@ func signinParams(settings config.Settings, cred Credential, unixMs int64, forSi
 	return builder.String()
 }
 
-// formEncode percent-encodes one query value the way URLSearchParams does:
-// the same character set as encodeURIComponent, except a space becomes "+".
+// formEncode percent-encodes one query value the way URLSearchParams does.
+//
+// That is *not* encodeURIComponent: the form-urlencoded set leaves only ASCII
+// alphanumerics and "*-._" alone, turns a space into "+", and escapes the
+// "!~'()" that encodeURIComponent preserves. The difference matters because the
+// signed query is hashed verbatim — a value carrying one of those characters
+// would digest differently from what the upstream reconstructs.
 func formEncode(value string) string {
-	return strings.ReplaceAll(encodeURIComponent(value), "%20", "+")
+	var builder strings.Builder
+	builder.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		char := value[i]
+		switch {
+		case char >= 'A' && char <= 'Z',
+			char >= 'a' && char <= 'z',
+			char >= '0' && char <= '9',
+			char == '*', char == '-', char == '.', char == '_':
+			builder.WriteByte(char)
+		case char == ' ':
+			builder.WriteByte('+')
+		default:
+			fmt.Fprintf(&builder, "%%%02X", char)
+		}
+	}
+	return builder.String()
 }
 
 // signinRequest builds a signed check-in request.
@@ -220,11 +241,10 @@ func (c *Client) signinRequest(ctx context.Context, settings config.Settings, cr
 	signedPath := path + "?" + signinParams(settings, cred, now.UnixMilli(), true)
 	wirePath := path + "?" + signinParams(settings, cred, now.UnixMilli(), false)
 
-	// yyPayload is "{}" for both the GET and the POST. The body string that
-	// feeds x-signature is different: an empty body for the GET, "{}" for the
-	// POST.
-	yyPayload := "{}"
-
+	// yy always receives "{}" for a GET and for a bodyless POST, so the two
+	// check-in shapes sign the same literal; a POST that does carry a body
+	// signs that body instead. x-signature is different again: the GET signs an
+	// empty string, the POST signs the bytes it sends. See yyBody.
 	var reader io.Reader
 	if method == http.MethodPost {
 		reader = strings.NewReader(body)
@@ -244,7 +264,7 @@ func (c *Client) signinRequest(ctx context.Context, settings config.Settings, cr
 	req.Header.Set("token", cred.Token)
 	req.Header.Set("x-timestamp", strconv.FormatInt(now.Unix(), 10))
 	req.Header.Set("x-signature", XSignature(now, body))
-	req.Header.Set("yy", YY(signedPath, yyPayload, now))
+	req.Header.Set("yy", YY(signedPath, yyBody(method, []byte(body)), now))
 	return req, nil
 }
 

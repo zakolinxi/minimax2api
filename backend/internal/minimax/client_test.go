@@ -506,3 +506,95 @@ func TestDownloadClientStillDialsTheProxyItself(t *testing.T) {
 		t.Fatalf("the proxy's own address must be exempt from the private-address check: %v", err)
 	}
 }
+
+// The model object carries two fields beyond the selector that this gateway
+// used to omit: `reasoning` and `thinking.effort`. Both are optional — an unset
+// pointer or an empty effort must not appear at all, because a fabricated value
+// is a 400 with nothing in it to explain the guess.
+func TestBuildMessageBodyCarriesReasoningAndEffort(t *testing.T) {
+	settings := config.DefaultSettings(t.TempDir())
+
+	reasoning := true
+	body := buildMessageBody(settings, Options{
+		Text:           "hi",
+		Model:          "MiniMax-M3.1-Flash",
+		Reasoning:      &reasoning,
+		ThinkingEffort: "high",
+		ContextLimit:   512000,
+	}, "turn-1")
+
+	model, ok := body["model"].(map[string]any)
+	if !ok {
+		t.Fatalf("model = %#v, want an object", body["model"])
+	}
+	if model["reasoning"] != true {
+		t.Errorf("reasoning = %#v, want true", model["reasoning"])
+	}
+	thinking, ok := model["thinking"].(map[string]any)
+	if !ok || thinking["effort"] != "high" {
+		t.Errorf("thinking = %#v, want {effort: high}", model["thinking"])
+	}
+	if model["context_limit"] != 512000 {
+		t.Errorf("context_limit = %#v", model["context_limit"])
+	}
+
+	// Nothing asked for, nothing sent.
+	plain := buildMessageBody(settings, Options{Text: "hi", Model: "MiniMax-M3"}, "turn-2")
+	selection, _ := plain["model"].(map[string]any)
+	if _, found := selection["reasoning"]; found {
+		t.Error("reasoning must be omitted when the caller says nothing")
+	}
+	if _, found := selection["thinking"]; found {
+		t.Error("thinking must be omitted when no effort was asked for")
+	}
+}
+
+// Tool invocations arrive inside the same chunk container as the text, split
+// across frames: the name first, then the arguments as deltas. They are merged
+// by id so a caller sees one entry per invocation rather than one per frame.
+func TestHandleFrameCollectsToolCalls(t *testing.T) {
+	client := &Client{}
+	result := &Result{}
+
+	frames := []string{
+		`data:{"type":6,"agent_message_chunk":{"msg_id":"m1","role":"assistant","tool_calls":[{"id":"call-1","name":"video_generation","args":"","argsDelta":"{\"prompt\":","status":"running"}]}}`,
+		`data:{"type":6,"agent_message_chunk":{"msg_id":"m1","role":"assistant","tool_calls":[{"id":"call-1","name":"video_generation","argsDelta":"\"cat\"}","status":"success","durationMs":1234}]}}`,
+		`data:{"type":6,"agent_message_chunk":{"msg_id":"m1","role":"assistant","tool_calls":[{"id":"call-2","name":"web_search","args":"{\"q\":\"x\"}","status":"error","result":"boom"}]}}`,
+	}
+	for _, frame := range frames {
+		if err := client.handleFrame(frame, Options{}, result); err != nil {
+			t.Fatalf("handleFrame(%s): %v", frame, err)
+		}
+	}
+
+	if len(result.ToolCalls) != 2 {
+		t.Fatalf("tool calls = %#v, want two", result.ToolCalls)
+	}
+	first := result.ToolCalls[0]
+	if first.ID != "call-1" || first.Name != "video_generation" {
+		t.Errorf("first = %#v", first)
+	}
+	if first.Args != `{"prompt":"cat"}` {
+		t.Errorf("args = %q, want the concatenated deltas", first.Args)
+	}
+	if first.Status != "success" || first.DurationMS != 1234 {
+		t.Errorf("first = %#v, want the final status and duration", first)
+	}
+	second := result.ToolCalls[1]
+	if second.ID != "call-2" || second.Result != "boom" {
+		t.Errorf("second = %#v", second)
+	}
+}
+
+// A text frame without tool_calls must not invent one, and an empty stream must
+// leave the slice nil so the zero Result stays cheap to compare.
+func TestHandleFrameWithoutToolCallsLeavesThemAlone(t *testing.T) {
+	client := &Client{}
+	result := &Result{}
+	if err := client.handleFrame(`data:{"type":6,"agent_message_chunk":{"msg_content":"hi"}}`, Options{}, result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ToolCalls) != 0 {
+		t.Fatalf("tool calls = %#v, want none", result.ToolCalls)
+	}
+}
