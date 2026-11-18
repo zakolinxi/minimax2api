@@ -46,6 +46,7 @@ import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 
 const DEFAULT_TARGET = "https://agent.minimax.io";
 const POLL_INTERVAL_MS = 1000;
@@ -827,6 +828,180 @@ async function runAutoLogin(session) {
 }
 
 // ---------------------------------------------------------------------------
+// Playwright driver (automated logins)
+// ---------------------------------------------------------------------------
+
+// The account site sits behind a bot sensor that rejects the /oauth2/login POST
+// when the browser is driven over a raw CDP socket, even though the form fills
+// and submits. A Playwright-launched context goes through the same flow and is
+// accepted, so automated sign-ins run here while manual windows keep the plain
+// Chrome path below.
+const PLAYWRIGHT_MODULE =
+  (process.env.BRIDGE_PLAYWRIGHT_MODULE || "").trim() ||
+  "/opt/venice2api/node_modules/playwright-core";
+
+let playwrightChromium;
+
+const localRequire = createRequire(import.meta.url);
+
+async function loadPlaywright() {
+  if (playwrightChromium !== undefined) return playwrightChromium;
+  try {
+    const mod = localRequire(PLAYWRIGHT_MODULE);
+    playwrightChromium = mod.chromium || (mod.default && mod.default.chromium) || null;
+  } catch {
+    playwrightChromium = null;
+  }
+  return playwrightChromium;
+}
+
+// Fills the unified login form. Email and password are used when a mailbox is
+// not wired in; otherwise the emailed one-time code is preferred because it
+// never burns a risk-control strike on a stale password.
+async function playwrightDriveLogin(page, session) {
+  const credentials = session.credentials || {};
+  const email = (credentials.email || "").trim();
+  const password = credentials.password || "";
+  const target = session.target;
+
+  const readToken = async () => {
+    try {
+      return await page.evaluate((k) => localStorage.getItem(k), TOKEN_KEY);
+    } catch {
+      return null;
+    }
+  };
+
+  await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.waitForTimeout(3500);
+
+  let token = await readToken();
+  if (token) return token;
+
+  const opened = await page.evaluate(() => {
+    const button = Array.from(document.querySelectorAll('button, [role="button"]')).find((el) => {
+      const text = (el.textContent || "").trim();
+      return text === "Sign in" || text === "Log in" || text === "登录";
+    });
+    if (!button) return false;
+    button.click();
+    return true;
+  });
+  if (!opened) throw new Error("no sign-in button on the agent site");
+
+  await page.waitForSelector('input[type="email"]', { timeout: 25000 });
+  await page.locator('input[type="email"]').first().fill(email);
+  await page.waitForTimeout(400);
+
+  await page.evaluate(() => {
+    const paragraph = Array.from(document.querySelectorAll("p")).find((el) =>
+      (el.textContent || "").includes("I have read and agree"),
+    );
+    if (!paragraph || !paragraph.parentElement) return;
+    const box = paragraph.parentElement.querySelector("button");
+    if (box) box.click();
+  });
+  await page.waitForTimeout(500);
+
+  await page.locator('button:has-text("Continue")').first().click({ timeout: 20000 });
+  await page.waitForSelector('input[type="password"]', { timeout: 25000 });
+
+  const codeButton = page.locator('button:has-text("Use email verification code")').first();
+  const useCode = Boolean(MAILBOX_DB) && (await codeButton.count()) > 0;
+
+  if (useCode) {
+    const since = Math.floor(Date.now() / 1000) - 300;
+    await codeButton.click();
+    const codeField = 'input:not([type="password"]):not([type="email"]):not([type="hidden"])';
+    await page.waitForSelector(codeField, { timeout: 25000 });
+
+    let code = null;
+    const until = Date.now() + 90000;
+    while (!code && Date.now() < until) {
+      code = mailboxCode(email, since);
+      if (!code) await page.waitForTimeout(2000);
+    }
+    if (!code) throw new Error("code sign-in: no verification code arrived in the mailbox");
+
+    await page.locator(codeField).first().fill(code);
+    await page.waitForTimeout(400);
+    await page.locator('button:has-text("Continue")').first().click({ timeout: 20000 });
+  } else {
+    if (!password) throw new Error("no mailbox configured and no password supplied");
+    await page.locator('input[type="password"]').first().fill(password);
+    await page.waitForTimeout(300);
+    await page.locator('button:has-text("Continue")').first().click({ timeout: 20000 });
+  }
+
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    token = await readToken();
+    if (token) return token;
+    await page.waitForTimeout(1500);
+  }
+  throw new Error("login did not produce a token");
+}
+
+async function runPlaywrightLogin(session, chromePath, proxy) {
+  const fail = (message) => {
+    delete session.credentials;
+    if (session.status !== "pending") return;
+    session.status = "error";
+    session.error = message;
+    console.log(`[bridge] ${session.id} playwright login failed: ${message}`);
+  };
+
+  const chromium = await loadPlaywright();
+  if (!chromium) {
+    fail("playwright is not installed");
+    return;
+  }
+
+  let context = null;
+  try {
+    context = await chromium.launchPersistentContext(PROFILE_DIR, {
+      executablePath: chromePath,
+      headless: false,
+      args: [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        ...(proxy ? [`--proxy-server=${proxy}`] : []),
+      ],
+      viewport: { width: 1366, height: 900 },
+      locale: "en-US",
+      timeout: 30000,
+    });
+    const pages = context.pages();
+    const page = pages.length ? pages[0] : await context.newPage();
+    page.setDefaultTimeout(25000);
+
+    const token = await playwrightDriveLogin(page, session);
+    delete session.credentials;
+    if (session.status !== "pending") return;
+    session.token = token;
+    session.host = (() => {
+      try {
+        return new URL(session.target).host;
+      } catch {
+        return null;
+      }
+    })();
+    session.status = "ok";
+    console.log(`[bridge] ${session.id} playwright login ok`);
+  } catch (error) {
+    fail(String((error && error.message) || error).slice(0, 180));
+  } finally {
+    if (context) {
+      try {
+        await context.close();
+      } catch {
+        /* the context is gone already */
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
@@ -1028,6 +1203,58 @@ async function handleLogin(req, res) {
       error: "a browser login window is already open; finish or cancel it first",
     });
     return;
+  }
+
+  // Automated logins go through Playwright: the raw-CDP browser below is
+  // rejected by the account site's bot sensor before /oauth2/login.
+  if (auto) {
+    const chromium = await loadPlaywright();
+    if (chromium) {
+      try {
+        fs.mkdirSync(PROFILE_DIR, { recursive: true });
+      } catch (error) {
+        sendJson(res, 500, { error: `could not create the profile dir: ${error.message}` });
+        return;
+      }
+      profileChrome = PROFILE_RESERVED;
+      const id = globalThis.crypto.randomUUID();
+      const session = {
+        id,
+        target,
+        chromePid: 0,
+        chromeProc: null,
+        debugPort: 0,
+        userDataDir: PROFILE_DIR,
+        status: "pending",
+        token: null,
+        host: null,
+        error: null,
+        cdp: null,
+        timer: null,
+        auto,
+        armed: true,
+        credentials: { email, password },
+        createdAt: Date.now(),
+        deadline: Date.now() + TTL_MS,
+      };
+      sessions.set(id, session);
+      console.log(
+        `[bridge] ${id} started target=${target} auto=1 driver=playwright${proxy ? ` proxy=${proxy}` : ""} ttl=${Math.round(TTL_MS / 1000)}s`,
+      );
+      sendJson(res, 200, { sessionId: id, target, chromePid: 0, auto });
+
+      runPlaywrightLogin(session, chrome, proxy)
+        .catch((error) => {
+          if (session.status !== "pending") return;
+          session.status = "error";
+          session.error = String((error && error.message) || error).slice(0, 180);
+          console.log(`[bridge] ${id} error ${session.error}`);
+        })
+        .finally(() => {
+          if (profileChrome === PROFILE_RESERVED) profileChrome = null;
+        });
+      return;
+    }
   }
 
   let debugPort;

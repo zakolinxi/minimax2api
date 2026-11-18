@@ -164,11 +164,23 @@ func (a *API) relogin(ctx context.Context, account *store.Account) error {
 		return err
 	}
 
+	// A changed user id means the login landed on a different upstream identity,
+	// and that identity's agents are new: every agent id stored from the old one
+	// is refused with `session ownership denied`, which surfaces as a 200 that
+	// opens no session. Dropping the id here makes the next discovery adopt the
+	// new account's own agent instead of leaving a stale one to be retried
+	// forever.
+	identityChanged := strings.TrimSpace(account.UserID) != "" &&
+		strings.TrimSpace(account.UserID) != strings.TrimSpace(info.RealUserID)
+
 	if _, err := a.store.UpdateAccount(account.ID, func(target *store.Account) {
 		target.Token = token
 		target.UserID = info.RealUserID
 		if label := info.Label(); label != "" {
 			target.Identifier = label
+		}
+		if identityChanged {
+			target.AgentID = ""
 		}
 		target.Status = store.StatusActive
 		target.CooldownUntil = time.Time{}
@@ -178,6 +190,13 @@ func (a *API) relogin(ctx context.Context, account *store.Account) error {
 		target.LastLoginError = ""
 	}); err != nil {
 		return err
+	}
+
+	// The account has a token it can use, but not yet an agent id it can drive:
+	// fill that in now rather than waiting for the next scheduled probe, which
+	// would leave it failing until then.
+	if identityChanged {
+		a.prepareAccount(ctx, account.ID)
 	}
 
 	a.goSyncQuotaDetached(account.ID)

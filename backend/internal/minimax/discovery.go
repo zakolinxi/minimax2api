@@ -113,10 +113,19 @@ func (p *PrepareResult) AgentID() string {
 // old id would keep driving the old agent with no symptom at all. That is why
 // the stored id is revisited rather than only filled in when empty.
 //
-// The one thing it will not do is overwrite a hand-pinned id. An id that does
-// not appear in the account's agent list did not come from a discovery, so it is
-// left alone — the same rule the rest of the config follows, where a value that
-// could not have been produced by the defaults is treated as intent.
+// A stored id the account does not list is stale, and it is replaced — but only
+// when the list itself is authoritative, i.e. it came back with entries in it.
+// The distinction matters because a re-login can land the account on a *fresh
+// upstream identity*: the user id changes, the old agent ids stay in the store,
+// and every session create is then answered
+// `{"status_code":1406010061,"status_msg":"session ownership denied"}`. That is
+// a 200 with no session in it, so it looks like a broken upstream rather than a
+// stale id, and an install that leaves the id alone leaves those accounts
+// permanently broken. An empty list proves nothing (a brand new account lists
+// nothing, and a hand-pinned id is still the operator's intent there), so a pin
+// survives that case — the same rule the rest of the config follows, where a
+// value that could not have been produced by the defaults is treated as intent
+// until the account contradicts it.
 func (p *PrepareResult) ResolveAgentID(stored string) (string, bool) {
 	preferred := p.AgentID()
 	if preferred == "" || preferred == stored {
@@ -126,7 +135,10 @@ func (p *PrepareResult) ResolveAgentID(stored string) (string, bool) {
 		return preferred, true
 	}
 	if !p.knowsAgent(stored) {
-		return stored, false
+		if len(p.Agents) == 0 {
+			return stored, false
+		}
+		return preferred, true
 	}
 	return preferred, true
 }
