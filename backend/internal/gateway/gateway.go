@@ -471,8 +471,19 @@ func (g *Gateway) acquireAccount(ctx context.Context, sessionKey string, model *
 		return account.Kind != store.KindMCode
 	}
 	if mcodeModel || (model != nil && model.SubscriptionOnly) {
+		// mcode speaks the stateless Anthropic Messages API, so there is no
+		// session affinity to preserve. Passing SessionKey here lets pick()'s
+		// sticky branch win over round_robin, which pins every request made
+		// with one API key to a single account until stickyTTL expires and
+		// leaves the rest of the pool idle until that account is exhausted.
+		// Blanking it lets the configured round_robin spread turns across the
+		// whole mcode pool.
+		leaseKey := sessionKey
+		if mcodeModel {
+			leaseKey = ""
+		}
 		opts := pool.AcquireOptions{
-			SessionKey: sessionKey,
+			SessionKey: leaseKey,
 			Eligible:   eligible,
 			// Models billed against a plan are not gated by the credit balance.
 			IgnoreCreditGuard: true,
